@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="ai.crystalgram.holo">
+
+    <uses-sdk
+        android:minSdkVersion="16"
+        android:targetSdkVersion="34" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="18" />
+
+    <!--
+        Theme.Holo, not Theme.Holo.Light.DarkActionBar.
+
+        The ".Light" family sets colorBackground=background_holo_light, so the
+        window under the action bar comes out white even though the action bar
+        itself is dark. For a dark Holo app the parent must be Theme.Holo
+        (colorBackground=background_holo_dark). The whole app uses the platform
+        theme; no colour overrides in code except the bubbles.
+    -->
+    <application
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.Holo"
+        android:allowBackup="false">
+
+        <!-- Login is the launcher: the ToS disclosure must come before any
+             credentials are requested. MainActivity (chat list) follows it. -->
+        <activity
+            android:name=".LoginActivity"
+            android:label="@string/app_name"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".MainActivity"
+            android:label="@string/app_name" />
+
+        <activity
+            android:name=".ChatActivity"
+            android:label="@string/app_name"
+            android:windowSoftInputMode="stateAlwaysHidden|adjustResize"
+            android:parentActivityName=".MainActivity" />
+
+        <activity
+            android:name=".TdProbeActivity"
+            android:label="TDLib probe"
+            android:parentActivityName=".MainActivity" />
+
+        <activity
+            android:name=".AboutActivity"
+            android:label="@string/about_title"
+            android:parentActivityName=".MainActivity" />
+
+    </application>
+
+</manifest>

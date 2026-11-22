@@ -1,0 +1,23 @@
+// Root project. Kept deliberately minimal: no Kotlin, no AndroidX, no
+// Material Components, no Compose. Everything builds on Gradle 7.6.3 +
+// AGP 7.4.2 targeting minSdkVersion 16 (Android 4.1 Jelly Bean).
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:7.4.2'
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.buildDir
+}

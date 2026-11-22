@@ -1,0 +1,5 @@
+// Tells Gradle this is a multi-project build and where the module lives.
+// Without this file Gradle treats the directory as a single-project build and
+// `assembleDebug` does not exist.
+rootProject.name = 'CrystalGramHolo'
+include ':app'

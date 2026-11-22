@@ -1,0 +1,18 @@
+--- a/wolfcrypt/src/port/arm/armv8-32-sha3-asm.S
++++ b/wolfcrypt/src/port/arm/armv8-32-sha3-asm.S
+@@ -126,13 +126,13 @@
+ 	veor	d27, d27, d30
+ 	veor	d27, d27, d31
+ 	# t[3]
+-	vldr.8	d31, [r3]
++	vld1.8	{d31}, [r3]
+ 	vshr.u64	d30, d31, #63
+ 	vshl.u64	d31, d31, #1
+ 	veor	d28, d28, d30
+ 	veor	d28, d28, d31
+ 	# t[4]
+-	vldr.8	d31, [r3, #8]
++	vld1.8	{d31}, [r3:64]
+ 	vshr.u64	d30, d31, #63
+ 	vshl.u64	d31, d31, #1
+ 	veor	d29, d29, d30

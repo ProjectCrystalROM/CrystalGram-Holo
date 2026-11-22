@@ -1,0 +1,47 @@
+apply plugin: 'com.android.application'
+
+// Telegram API credentials come from local.properties (git-ignored), never from
+// source. Read here at configure time and baked into BuildConfig.
+def localProps = new Properties()
+def localFile = rootProject.file('local.properties')
+if (localFile.exists()) {
+    localFile.withInputStream { localProps.load(it) }
+}
+def tgApiId = (localProps.getProperty('api_id') ?: '0').trim()
+def tgApiHash = (localProps.getProperty('api_hash') ?: '').trim()
+
+android {
+    compileSdk 34
+    ndkVersion '23.2.8568313'
+    buildToolsVersion '34.0.0'
+
+    defaultConfig {
+        applicationId "ai.crystalgram.holo"
+        minSdkVersion 16
+        targetSdkVersion 34
+        versionCode 1
+        versionName "0.2-auth"
+
+        buildConfigField "int", "TG_API_ID", tgApiId
+        buildConfigField "String", "TG_API_HASH", "\"${tgApiHash}\""
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    // Framework UI only: android.app / android.widget / android.view, Theme.Holo.
+    // Nothing from AndroidX, Material or Compose.
+}
