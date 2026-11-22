@@ -2,7 +2,9 @@ package ai.crystalgram.holo;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Color;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -19,6 +21,7 @@ import android.view.ViewGroup;
 import android.widget.BaseAdapter;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.Toast;
 import android.widget.LinearLayout;
 import android.widget.ImageView;
 import android.widget.ListView;
@@ -28,6 +31,7 @@ import android.widget.TextView;
 import org.drinkless.tdlib.Client;
 import org.drinkless.tdlib.TdApi;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -129,6 +133,12 @@ public class ChatActivity extends Activity {
         entry.setGravity(Gravity.CENTER_VERTICAL);
         entry.setPadding(dp(8), dp(6), dp(8), dp(6));
 
+        new Thread(new Runnable() {
+            @Override public void run() {
+                UploadCleanup.sweep(new File(getCacheDir(), "outgoing"));
+            }
+        }, "cg-sweep").start();
+
         input = new EditText(this);
         input.setHint("Message");
         input.addTextChangedListener(new android.text.TextWatcher() {
@@ -223,8 +233,17 @@ public class ChatActivity extends Activity {
         };
     }
 
+    private static final int REQ_PICK = 1001;
+
+    @Override
+    public boolean onCreateOptionsMenu(android.view.Menu menu) {
+        menu.add(0, 3, 0, "Attach");
+        return true;
+    }
+
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
+        if (item.getItemId() == 3) { pickFile(); return true; }
         if (item.getItemId() == android.R.id.home) { finish(); return true; }
         return super.onOptionsItemSelected(item);
     }
@@ -749,5 +768,187 @@ public class ChatActivity extends Activity {
 
     private void hideConnBanner() {
         connBanner.setVisibility(View.GONE);
+    }
+
+    // ---- sending media ----------------------------------------------------
+
+    /**
+     * Opens the system picker.
+     *
+     * ACTION_GET_CONTENT with * / * is the one intent that works across the
+     * file managers and gallery apps actually present on Jelly Bean without
+     * bundling a picker of our own.
+     */
+    private void pickFile() {
+        Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+        i.setType("*/*");
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        try {
+            startActivityForResult(i, REQ_PICK);
+        } catch (Throwable t) {
+            Toast.makeText(this, "No file picker available", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req != REQ_PICK || res != RESULT_OK || data == null) return;
+        final Uri uri = data.getData();
+        if (uri == null) return;
+        final String mime = getContentResolver().getType(uri);
+        String name = displayNameOf(uri);
+        sendPicked(uri, mime, name);
+    }
+
+    private String displayNameOf(Uri uri) {
+        String name = null;
+        android.database.Cursor c = null;
+        try {
+            c = getContentResolver().query(uri, null, null, null, null);
+            if (c != null && c.moveToFirst()) {
+                int idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                if (idx >= 0) name = c.getString(idx);
+            }
+        } catch (Throwable ignored) {
+            // some providers refuse to answer; the fallback name is fine
+        } finally {
+            if (c != null) c.close();
+        }
+        if (name == null) {
+            String last = uri.getLastPathSegment();
+            name = last == null ? "upload" : last;
+        }
+        return name;
+    }
+
+    /**
+     * Stages the file, shrinks it if it is a photo on a slow link, and sends.
+     *
+     * All of it happens off the UI thread: a 3 MP decode is seconds of work on
+     * a Cortex-A7 and would freeze the compose bar.
+     */
+    private void sendPicked(final Uri uri, final String mime, final String name) {
+        final boolean slow = isSlowLink();
+        Toast.makeText(this, "Preparing\u2026", Toast.LENGTH_SHORT).show();
+        new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    UploadPrep.Kind kind = UploadPrep.kindOf(mime);
+
+                    // Prefer the file that already exists; copy only when the
+                    // provider has nothing behind the URI.
+                    File staged = UploadPrep.resolvePath(ChatActivity.this, uri);
+                    if (staged == null) {
+                        staged = UploadPrep.stage(ChatActivity.this, uri, name);
+                    }
+
+                    File toSend = staged;
+                    if (kind == UploadPrep.Kind.PHOTO && slow) {
+                        toSend = UploadPrep.shrinkPhoto(staged,
+                                UploadPrep.MOBILE_MAX_PX, UploadPrep.MOBILE_QUALITY);
+                    }
+
+                    final String note = UploadPrep.estimate((int) toSend.length(), slow);
+                    final File finalFile = toSend;
+                    final UploadPrep.Kind finalKind = kind;
+                    final String finalName = name;
+                    final String finalMime = mime;
+
+                    ui.post(new Runnable() {
+                        @Override public void run() {
+                            if (note != null) {
+                                Toast.makeText(ChatActivity.this,
+                                        UploadPrep.sizeLabel(finalFile.length()) + " \u00b7 " + note,
+                                        Toast.LENGTH_LONG).show();
+                            }
+                            sendFile(finalFile, finalKind, finalName, finalMime);
+                        }
+                    });
+                } catch (final Throwable t) {
+                    ui.post(new Runnable() {
+                        @Override public void run() {
+                            Toast.makeText(ChatActivity.this,
+                                    "Could not prepare file: " + t.getMessage(),
+                                    Toast.LENGTH_LONG).show();
+                        }
+                    });
+                }
+            }
+        }, "cg-upload").start();
+    }
+
+    private void sendFile(File f, UploadPrep.Kind kind, String name, String mime) {
+        // Only a file we copied is ours to delete; a Gallery file is the user's.
+        final File tracked = f.getPath().contains("/outgoing/") ? f : null;
+        TdApi.InputFileLocal file = new TdApi.InputFileLocal(f.getPath());
+        TdApi.InputMessageContent content;
+
+        if (kind == UploadPrep.Kind.PHOTO) {
+            TdApi.InputPhoto photo = new TdApi.InputPhoto();
+            photo.photo = file;
+            int[] dim = UploadPrep.dimensionsOf(f);
+            photo.width = dim == null ? 0 : dim[0];
+            photo.height = dim == null ? 0 : dim[1];
+
+            TdApi.InputMessagePhoto m = new TdApi.InputMessagePhoto();
+            m.photo = photo;
+            m.caption = new TdApi.FormattedText("", null);
+            content = m;
+
+        } else if (kind == UploadPrep.Kind.VIDEO) {
+            TdApi.InputVideo video = new TdApi.InputVideo();
+            video.video = file;
+            video.duration = 0;   // let TDLib read it from the container
+
+            TdApi.InputMessageVideo m = new TdApi.InputMessageVideo();
+            m.video = video;
+            m.caption = new TdApi.FormattedText("", null);
+            content = m;
+
+        } else {
+            TdApi.InputDocument doc = new TdApi.InputDocument();
+            doc.document = file;
+            TdApi.InputMessageDocument m = new TdApi.InputMessageDocument();
+            m.document = doc;
+            m.caption = new TdApi.FormattedText("", null);
+            content = m;
+        }
+
+        Td.send(new TdApi.SendMessage(chatId, null, null,
+                new TdApi.MessageSendOptions(), null, content),
+                new Client.ResultHandler() {
+                    @Override public void onResult(TdApi.Object o) {
+                        // The returned message carries the temporary id that
+                        // UpdateMessageSendSucceeded will report as oldMessageId.
+                        if (o instanceof TdApi.Message && tracked != null) {
+                            UploadCleanup.track(((TdApi.Message) o).id, tracked);
+                        }
+                    }
+                });
+    }
+
+    /**
+     * True when the upload will go over the cellular link.
+     *
+     * This phone has no LTE; mobile data is EVDO Rev. A, about 100-150 kbps up.
+     * WiFi is always treated as fast.
+     */
+    private boolean isSlowLink() {
+        try {
+            android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            android.net.NetworkInfo ni = cm == null ? null : cm.getActiveNetworkInfo();
+            if (ni == null || !ni.isConnected()) return false;
+            int t = ni.getType();
+            if (t == android.net.ConnectivityManager.TYPE_WIFI
+                    || t == android.net.ConnectivityManager.TYPE_ETHERNET
+                    || t == android.net.ConnectivityManager.TYPE_WIMAX) {
+                return false;
+            }
+            return t == android.net.ConnectivityManager.TYPE_MOBILE;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 }

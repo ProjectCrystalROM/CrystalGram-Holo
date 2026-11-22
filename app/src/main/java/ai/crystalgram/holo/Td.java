@@ -176,6 +176,8 @@ public final class Td {
                 if (c != null) c.onNewMessage(((TdApi.UpdateNewMessage) object).message);
 
             } else if (object instanceof TdApi.UpdateMessageSendSucceeded) {
+                TdApi.UpdateMessageSendSucceeded ok = (TdApi.UpdateMessageSendSucceeded) object;
+                UploadCleanup.onSent(ok.message);
                 ChatActivity c = conversation;
                 if (c != null) {
                     TdApi.UpdateMessageSendSucceeded u = (TdApi.UpdateMessageSendSucceeded) object;
@@ -183,6 +185,8 @@ public final class Td {
                 }
 
             } else if (object instanceof TdApi.UpdateMessageSendFailed) {
+                TdApi.UpdateMessageSendFailed bad = (TdApi.UpdateMessageSendFailed) object;
+                UploadCleanup.onFailed(bad.message);
                 ChatActivity c = conversation;
                 if (c != null) {
                     TdApi.UpdateMessageSendFailed u = (TdApi.UpdateMessageSendFailed) object;
