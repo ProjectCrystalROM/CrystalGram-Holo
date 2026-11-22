@@ -20,6 +20,8 @@ public final class Td {
     private static Client client;
     private static final Object lock = new Object();
     private static volatile long myId;
+    private static final java.util.HashMap<Long, TdApi.Chat> chats =
+            new java.util.HashMap<Long, TdApi.Chat>();
     private static final java.util.HashMap<Long, TdApi.User> users =
             new java.util.HashMap<Long, TdApi.User>();
 
@@ -27,6 +29,7 @@ public final class Td {
     private static volatile LoginActivity login;
     private static volatile MainActivity chatList;
     private static volatile ChatActivity conversation;
+    private static volatile NotificationService notifier;
 
     private Td() {}
 
@@ -38,6 +41,11 @@ public final class Td {
     /** Our own user id, learned from the authorization state. */
     static long me() {
         return myId;
+    }
+
+    /** Cached chats, learned from UpdateNewChat. */
+    static TdApi.Chat chat(long id) {
+        synchronized (lock) { return chats.get(id); }
     }
 
     static TdApi.User user(long id) {
@@ -62,6 +70,18 @@ public final class Td {
         c.send(query, handler);
     }
 
+    static void setNotifier(NotificationService s) { notifier = s; }
+
+    /**
+     * The "online" option tells TDLib whether the user is actively present.
+     * While true, TDLib assumes the user is looking at the app and suppresses
+     * message notifications entirely, so it must be false whenever no screen
+     * is in front of the user.
+     */
+    static void setOnline(boolean online) {
+        send(new TdApi.SetOption("online", new TdApi.OptionValueBoolean(online)));
+    }
+
     static void setLogin(LoginActivity a) { login = a; }
     static void clearLogin(LoginActivity a) { if (login == a) login = null; }
 
@@ -76,6 +96,8 @@ public final class Td {
         @Override
         public void onResult(TdApi.Object object) {
             if (object instanceof TdApi.UpdateNewChat) {
+                TdApi.Chat nc = ((TdApi.UpdateNewChat) object).chat;
+                synchronized (lock) { chats.put(nc.id, nc); }
                 MainActivity a = chatList;
                 if (a != null) a.onChat(((TdApi.UpdateNewChat) object).chat);
 
@@ -97,6 +119,24 @@ public final class Td {
             } else if (object instanceof TdApi.UpdateUser) {
                 TdApi.UpdateUser u = (TdApi.UpdateUser) object;
                 synchronized (lock) { users.put(u.user.id, u.user); }
+
+            } else if (object instanceof TdApi.UpdateNotificationGroup) {
+                TdApi.UpdateNotificationGroup u = (TdApi.UpdateNotificationGroup) object;
+                if (notifier != null) notifier.onNotificationGroup(u);
+
+            } else if (object instanceof TdApi.UpdateNotification) {
+                TdApi.UpdateNotification u = (TdApi.UpdateNotification) object;
+                if (notifier != null) notifier.onNotification(u);
+
+            } else if (object instanceof TdApi.UpdateActiveNotifications) {
+                TdApi.UpdateActiveNotifications u = (TdApi.UpdateActiveNotifications) object;
+                if (notifier != null) notifier.onActiveNotifications(u);
+
+            } else if (object instanceof TdApi.UpdateChatReadInbox) {
+                TdApi.UpdateChatReadInbox u = (TdApi.UpdateChatReadInbox) object;
+                if (notifier != null) notifier.onChatRead(u.chatId, u.lastReadInboxMessageId);
+                MainActivity a = chatList;
+                if (a != null) a.onChatUpdated(u.chatId);
 
             } else if (object instanceof TdApi.UpdateChatAction) {
                 TdApi.UpdateChatAction u = (TdApi.UpdateChatAction) object;

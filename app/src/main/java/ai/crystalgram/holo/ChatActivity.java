@@ -141,6 +141,7 @@ public class ChatActivity extends Activity {
         setContentView(root);
 
         Td.send(new TdApi.OpenChat(chatId));
+        NotificationService.setOpenChat(chatId);
         loadNewest();
     }
 

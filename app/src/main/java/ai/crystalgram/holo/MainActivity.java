@@ -328,4 +328,18 @@ public class MainActivity extends android.app.Activity {
             return tv;
         }
     }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Visible chat list counts as present: TDLib may suppress notifications
+        // while online, which is correct only while a screen is in front.
+        Td.setOnline(true);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        Td.setOnline(false);
+    }
 }

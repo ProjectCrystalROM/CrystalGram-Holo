@@ -227,6 +227,11 @@ public class LoginActivity extends Activity {
             } else if (state instanceof TdApi.AuthorizationStateReady) {
                 Log.i(TAG, "authorized");
                 // Learn our own user id so typing indicators can ignore us.
+                // TDLib does not generate notifications for a client it believes
+                // is online and in the foreground. Nothing here ever sets this
+                // option, so it may default to online, in which case the whole
+                // notification pipeline stays silent.
+                Td.setOnline(false);
                 Td.send(new TdApi.GetMe(), new Client.ResultHandler() {
                     @Override public void onResult(TdApi.Object o) {
                         if (o instanceof TdApi.User) Td.setMe(((TdApi.User) o).id);
@@ -235,6 +240,11 @@ public class LoginActivity extends Activity {
                 Td.clearLogin(this);
                 ui.post(new Runnable() {
                     @Override public void run() {
+                        // Hold the connection for notifications. Token type 7
+                        // (MTProto separate session): no push transport, no
+                        // Google services, no extra app for the user.
+                        startService(new Intent(LoginActivity.this,
+                                NotificationService.class));
                         startActivity(new Intent(LoginActivity.this, MainActivity.class));
                         finish();
                     }
