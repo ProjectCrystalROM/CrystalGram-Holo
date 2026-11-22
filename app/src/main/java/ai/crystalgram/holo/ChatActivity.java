@@ -20,7 +20,9 @@ import android.widget.BaseAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ImageView;
 import android.widget.ListView;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 
 import org.drinkless.tdlib.Client;
@@ -57,6 +59,10 @@ public class ChatActivity extends Activity {
     /** Oldest message id currently held; 0 means "not known yet". */
     private long oldestMessageId;
     private Runnable typingHide;
+    private TextView connBanner;
+    private NetworkMonitor net;
+    /** The activity root, kept so nothing has to search for it. */
+    private LinearLayout layoutRoot;
     /** Wall clock of the last typing notification we sent to the server. */
     private long lastTypingSent;
     /** ChatActionTyping repeats are throttled to this interval. */
@@ -79,6 +85,15 @@ public class ChatActivity extends Activity {
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
+        layoutRoot = root;
+
+        connBanner = new TextView(this);
+        connBanner.setTextSize(13);
+        connBanner.setTextColor(0xFFFFFFFF);
+        connBanner.setBackgroundColor(0xFF3A3A3A);
+        connBanner.setPadding(dp(12), dp(6), dp(12), dp(6));
+        connBanner.setVisibility(View.GONE);
+        root.addView(connBanner);
 
         list = new ListView(this);
         adapter = new MessageAdapter();
@@ -142,6 +157,7 @@ public class ChatActivity extends Activity {
 
         Td.send(new TdApi.OpenChat(chatId));
         NotificationService.setOpenChat(chatId);
+        MediaLoader.get().addListener(mediaListener);
         loadNewest();
     }
 
@@ -358,6 +374,23 @@ public class ChatActivity extends Activity {
         }
     }
 
+    // ---- media -----------------------------------------------------------
+
+    private final MediaLoader.Listener mediaListener = new MediaLoader.Listener() {
+        @Override public void onMediaUpdated(long ignoredChatId, int fileId) {
+            ui.post(new Runnable() {
+                @Override public void run() { adapter.notifyDataSetChanged(); }
+            });
+        }
+    };
+
+    /** TDLib told us a file changed; decode it if it is now local. */
+    void onFileUpdated(final TdApi.File file) {
+        if (file == null || file.local == null) return;
+        if (!file.local.isDownloadingCompleted) return;
+        MediaLoader.get().decodeAsync(file, dp(320));
+    }
+
     private void scrollToBottom() {
         if (adapter.getCount() > 0) list.setSelection(adapter.getCount() - 1);
         markVisibleAsRead();
@@ -486,20 +519,44 @@ public class ChatActivity extends Activity {
             boolean outgoing = m.isOutgoing;
             String text = textOf(m);
             String time = timeOf(m);
-            row.bind(withTimestamp(text, time, outgoing, failed.contains(m.id)), outgoing);
+            MediaVm media = MediaVm.of(m, MediaLoader.get());
+            row.bind(withTimestamp(text, time, outgoing, failed.contains(m.id)),
+                    outgoing, media, iconFor(m));
             return row;
+        }
+
+        private int iconFor(TdApi.Message m) {
+            if (m.content instanceof TdApi.MessageDocument) {
+                return android.R.drawable.ic_menu_save;
+            }
+            if (m.content instanceof TdApi.MessageVideo) {
+                return android.R.drawable.ic_media_play;
+            }
+            return 0;
         }
 
         private String textOf(TdApi.Message m) {
             if (m.content instanceof TdApi.MessageText) {
                 return ((TdApi.MessageText) m.content).text.text;
             }
-            if (m.content instanceof TdApi.MessagePhoto) return "[Photo]";
-            if (m.content instanceof TdApi.MessageVideo) return "[Video]";
-            if (m.content instanceof TdApi.MessageSticker) return "[Sticker]";
-            if (m.content instanceof TdApi.MessageVoiceNote) return "[Voice message]";
-            if (m.content instanceof TdApi.MessageDocument) return "[Document]";
-            return "[" + m.content.getClass().getSimpleName().replace("Message", "") + "]";
+            // Captions belong under the media; the media itself is drawn by
+            // MediaVm. No bracketed placeholders.
+            if (m.content instanceof TdApi.MessagePhoto) {
+                return captionOf(((TdApi.MessagePhoto) m.content).caption);
+            }
+            if (m.content instanceof TdApi.MessageVideo) {
+                return captionOf(((TdApi.MessageVideo) m.content).caption);
+            }
+            if (m.content instanceof TdApi.MessageDocument) {
+                return captionOf(((TdApi.MessageDocument) m.content).caption);
+            }
+            if (m.content instanceof TdApi.MessageSticker) return "";
+            if (m.content instanceof TdApi.MessageVoiceNote) return "";
+            return "";
+        }
+
+        private String captionOf(TdApi.FormattedText ft) {
+            return ft == null || ft.text == null ? "" : ft.text;
         }
 
         private String timeOf(TdApi.Message m) {
@@ -532,6 +589,10 @@ public class ChatActivity extends Activity {
     /** Full-width row holding one bubble, aligned by direction. */
     private class Row extends LinearLayout {
         private final TextView bubble;
+        private final ImageView image;
+        private final LinearLayout mediaBox;
+        private final TextView mediaLabel;
+        private final ProgressBar progress;
 
         Row(Context ctx) {
             super(ctx);
@@ -539,23 +600,154 @@ public class ChatActivity extends Activity {
             int margin = dp(6);
             setPadding(dp(8), margin, dp(8), margin);
 
+            LinearLayout column = new LinearLayout(ctx);
+            column.setOrientation(VERTICAL);
+
+            // Media sits above the text inside the same bubble, as in Telegram.
+            mediaBox = new LinearLayout(ctx);
+            mediaBox.setOrientation(VERTICAL);
+            mediaBox.setVisibility(GONE);
+
+            image = new ImageView(ctx);
+            image.setAdjustViewBounds(true);
+            image.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            image.setVisibility(GONE);
+            mediaBox.addView(image, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT));
+
+            mediaLabel = new TextView(ctx);
+            mediaLabel.setTextSize(14);
+            mediaLabel.setTextColor(Palette.BUBBLE_TEXT);
+            mediaLabel.setVisibility(GONE);
+            mediaBox.addView(mediaLabel);
+
+            progress = new ProgressBar(ctx, null, android.R.attr.progressBarStyleHorizontal);
+            progress.setMax(100);
+            progress.setVisibility(GONE);
+            mediaBox.addView(progress, new LinearLayout.LayoutParams(dp(140), dp(4)));
+
+            column.addView(mediaBox);
+
             bubble = new TextView(ctx);
             bubble.setTextSize(15);
             bubble.setTextColor(Palette.BUBBLE_TEXT);
             bubble.setPadding(dp(11), dp(7), dp(11), dp(7));
-            addView(bubble, new LinearLayout.LayoutParams(
+            column.addView(bubble);
+
+            addView(column, new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT));
         }
 
+        /**
+         * @param iconRes drawable for a non-image attachment (file, sticker,
+         *                video), or 0 for none
+         */
         void bind(CharSequence content, boolean outgoing) {
+            bind(content, outgoing, null, 0);
+        }
+
+        void bind(CharSequence content, boolean outgoing, MediaVm media, int iconRes) {
             bubble.setText(content);
-            ((LayoutParams) bubble.getLayoutParams()).gravity =
-                    outgoing ? Gravity.END : Gravity.START;
-            setGravity(outgoing ? Gravity.END : Gravity.START);
-            bubble.setBackgroundDrawable(outgoing
+            LayoutParams lp = (LayoutParams) getChildAt(0).getLayoutParams();
+            lp.gravity = outgoing ? Gravity.END : Gravity.START;
+            getChildAt(0).setBackgroundDrawable(outgoing
                     ? BubbleDrawable.sent(density)
                     : BubbleDrawable.received(density));
+            setGravity(outgoing ? Gravity.END : Gravity.START);
+
+            mediaBox.setVisibility(media == null ? GONE : VISIBLE);
+            if (media == null) {
+                image.setVisibility(GONE);
+                mediaLabel.setVisibility(GONE);
+                progress.setVisibility(GONE);
+                return;
+            }
+
+            // Bitmap already decoded and known by id.
+            android.graphics.Bitmap bmp = media.bitmap();
+            if (bmp != null) {
+                image.setImageBitmap(bmp);
+                image.setVisibility(VISIBLE);
+                mediaLabel.setVisibility(GONE);
+                image.getLayoutParams().width = Math.min(bmp.getWidth(), dp(220));
+                image.getLayoutParams().height = ViewGroup.LayoutParams.WRAP_CONTENT;
+            } else {
+                image.setVisibility(GONE);
+                mediaLabel.setVisibility(VISIBLE);
+                mediaLabel.setText(media.label);
+                if (iconRes != 0) {
+                    mediaLabel.setCompoundDrawablesWithIntrinsicBounds(iconRes, 0, 0, 0);
+                    mediaLabel.setCompoundDrawablePadding(dp(6));
+                }
+            }
+
+            if (media.state == MediaVm.DOWNLOADING) {
+                progress.setVisibility(VISIBLE);
+                progress.setIndeterminate(false);
+                progress.setProgress(media.percent());
+            } else if (media.state == MediaVm.PENDING) {
+                progress.setVisibility(VISIBLE);
+                progress.setIndeterminate(true);
+            } else {
+                progress.setVisibility(GONE);
+            }
         }
+    }
+
+    // ---- connection -------------------------------------------------------
+
+    /**
+     * Same connection indicator the chat list shows, for the same reason: a
+     * message that fails to send because the connection dropped should not look
+     * like a bug in the chat.
+     *
+     * Upstream Telegram shows this too; the states come straight from TDLib.
+     */
+    private void startNetworkWatch() {
+        if (net == null) net = new NetworkMonitor(this);
+        net.start(new NetworkMonitor.Listener() {
+            @Override public void onNetworkAvailable(boolean available, TdApi.NetworkType type) {
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        if (available && Td.isReady()) hideConnBanner();
+                    }
+                });
+            }
+        });
+        Td.setConnectionListener(new Td.ConnectionListener() {
+            @Override public void onConnectionState(final TdApi.ConnectionState st) {
+                runOnUiThread(new Runnable() {
+                    @Override public void run() { showConnState(st); }
+                });
+            }
+        });
+        if (Td.connectionState() != null) showConnState(Td.connectionState());
+    }
+
+    private void showConnState(TdApi.ConnectionState st) {
+        if (st instanceof TdApi.ConnectionStateReady) {
+            hideConnBanner();
+            return;
+        }
+        String text;
+        if (st instanceof TdApi.ConnectionStateWaitingForNetwork) {
+            text = "Waiting for network\u2026";
+        } else if (st instanceof TdApi.ConnectionStateConnecting) {
+            text = "Connecting\u2026";
+        } else if (st instanceof TdApi.ConnectionStateConnectingToProxy) {
+            text = "Connecting to proxy\u2026";
+        } else if (st instanceof TdApi.ConnectionStateUpdating) {
+            text = "Updating\u2026";
+        } else {
+            text = "Connecting\u2026";
+        }
+        connBanner.setText(text);
+        connBanner.setVisibility(View.VISIBLE);
+    }
+
+    private void hideConnBanner() {
+        connBanner.setVisibility(View.GONE);
     }
 }

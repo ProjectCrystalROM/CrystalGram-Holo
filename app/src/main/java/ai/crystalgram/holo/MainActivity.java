@@ -11,6 +11,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AdapterView;
 import android.widget.BaseAdapter;
+import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.TextView;
 
@@ -70,22 +71,63 @@ public class MainActivity extends android.app.Activity {
         empty.setPadding(dp(20), dp(20), dp(20), dp(20));
         empty.setVisibility(View.VISIBLE);
 
-        android.widget.FrameLayout root = new android.widget.FrameLayout(this);
-        root.addView(list, new ViewGroup.LayoutParams(
+        android.widget.FrameLayout stack = new android.widget.FrameLayout(this);
+        stack.addView(list, new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        root.addView(empty, new ViewGroup.LayoutParams(
+        stack.addView(empty, new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        setContentView(root);
 
-        Td.send(new TdApi.LoadChats(new TdApi.ChatListMain(), 100));
+        // Banner keeps the connection state visible instead of leaving a blank
+        // list that looks like there are no chats.
+        contentRoot = new LinearLayout(this);
+        contentRoot.setOrientation(LinearLayout.VERTICAL);
+        contentRoot.addView(stack, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        setContentView(contentRoot);
+
+        loadChatsFromCacheThenNetwork();
+    }
+
+    /**
+     * Cache first, network second.
+     *
+     * LoadChats asks TDLib to fetch the list from the server, which needs a
+     * connection and can take seconds. GetChats answers straight from the local
+     * database. Calling the cache read first paints the chats immediately, so a
+     * cold start on a slow or missing network shows what was there last time
+     * instead of an empty screen, and the network result simply refines it.
+     *
+     * The order matters: GetChats must not be skipped when LoadChats is slow,
+     * and LoadChats must still be issued so the list is current.
+     */
+    private void loadChatsFromCacheThenNetwork() {
         Td.send(new TdApi.GetChats(new TdApi.ChatListMain(), 100),
                 new Client.ResultHandler() {
                     @Override public void onResult(TdApi.Object object) {
                         if (object instanceof TdApi.Chats) {
                             onChatsLoaded(((TdApi.Chats) object).chatIds);
-                        } else if (object instanceof TdApi.Error) {
-                            Log.w(TAG, "GetChats: " + ((TdApi.Error) object).message);
                         }
+                    }
+                });
+
+        Td.send(new TdApi.LoadChats(new TdApi.ChatListMain(), 100),
+                new Client.ResultHandler() {
+                    @Override public void onResult(TdApi.Object object) {
+                        // 404 means the chat list is already fully loaded, which
+                        // is not an error worth showing anyone.
+                        if (object instanceof TdApi.Error) {
+                            TdApi.Error e = (TdApi.Error) object;
+                            if (e.code != 404) Log.w(TAG, "LoadChats: " + e.message);
+                            return;
+                        }
+                        Td.send(new TdApi.GetChats(new TdApi.ChatListMain(), 100),
+                                new Client.ResultHandler() {
+                                    @Override public void onResult(TdApi.Object o) {
+                                        if (o instanceof TdApi.Chats) {
+                                            onChatsLoaded(((TdApi.Chats) o).chatIds);
+                                        }
+                                    }
+                                });
                     }
                 });
     }
@@ -329,9 +371,12 @@ public class MainActivity extends android.app.Activity {
         }
     }
 
+    private NetworkMonitor net;
+
     @Override
     protected void onResume() {
         super.onResume();
+        startNetworkWatch();
         // Visible chat list counts as present: TDLib may suppress notifications
         // while online, which is correct only while a screen is in front.
         Td.setOnline(true);
@@ -341,5 +386,80 @@ public class MainActivity extends android.app.Activity {
     protected void onPause() {
         super.onPause();
         Td.setOnline(false);
+        if (net != null) net.stop();
+        Td.setConnectionListener(null);
+    }
+
+    // ---- connection -------------------------------------------------------
+
+    /**
+     * Starts watching the network and showing connection state.
+     *
+     * Without this a dropped connection looks identical to an empty chat list,
+     * and the only way out was to force-stop the app.
+     */
+    private void startNetworkWatch() {
+        if (net == null) net = new NetworkMonitor(this);
+        net.start(new NetworkMonitor.Listener() {
+            @Override public void onNetworkAvailable(boolean available, TdApi.NetworkType type) {
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        if (available && Td.isReady()) hideConnBanner();
+                        if (available) reloadChatsIfEmpty();
+                    }
+                });
+            }
+        });
+        Td.setConnectionListener(new Td.ConnectionListener() {
+            @Override public void onConnectionState(final TdApi.ConnectionState st) {
+                runOnUiThread(new Runnable() {
+                    @Override public void run() { showConnState(st); }
+                });
+            }
+        });
+        if (Td.connectionState() != null) showConnState(Td.connectionState());
+    }
+
+    private TextView connBanner;
+    /** Vertical container holding the banner above the list. */
+    private LinearLayout contentRoot;
+
+    private void ensureBanner() {
+        if (connBanner != null) return;
+        if (contentRoot == null) return;
+        connBanner = new TextView(this);
+        connBanner.setTextSize(13);
+        connBanner.setTextColor(0xFFFFFFFF);
+        connBanner.setBackgroundColor(0xFF3A3A3A);
+        connBanner.setPadding(dp(12), dp(6), dp(12), dp(6));
+        connBanner.setVisibility(View.GONE);
+        contentRoot.addView(connBanner, 0);
+    }
+
+    private void showConnState(TdApi.ConnectionState st) {
+        if (st instanceof TdApi.ConnectionStateReady) {
+            hideConnBanner();
+            return;
+        }
+        ensureBanner();
+        String text;
+        if (st instanceof TdApi.ConnectionStateWaitingForNetwork) text = "Waiting for network\u2026";
+        else if (st instanceof TdApi.ConnectionStateConnecting) text = "Connecting\u2026";
+        else if (st instanceof TdApi.ConnectionStateConnectingToProxy) text = "Connecting to proxy\u2026";
+        else if (st instanceof TdApi.ConnectionStateUpdating) text = "Updating\u2026";
+        else text = "Connecting\u2026";
+        connBanner.setText(text);
+        connBanner.setVisibility(View.VISIBLE);
+    }
+
+    private void hideConnBanner() {
+        if (connBanner != null) connBanner.setVisibility(View.GONE);
+    }
+
+    /** A connection that just came up should fill a list that came up empty. */
+    private void reloadChatsIfEmpty() {
+        if (Td.isReady()) {
+            Td.send(new TdApi.LoadChats(new TdApi.ChatListMain(), 100));
+        }
     }
 }

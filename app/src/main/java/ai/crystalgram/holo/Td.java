@@ -30,6 +30,13 @@ public final class Td {
     private static volatile MainActivity chatList;
     private static volatile ChatActivity conversation;
     private static volatile NotificationService notifier;
+    private static volatile ConnectionListener connectionListener;
+    private static volatile TdApi.ConnectionState connectionState;
+
+    /** Screens that want to know whether we are actually connected. */
+    interface ConnectionListener {
+        void onConnectionState(TdApi.ConnectionState state);
+    }
 
     private Td() {}
 
@@ -71,6 +78,15 @@ public final class Td {
     }
 
     static void setNotifier(NotificationService s) { notifier = s; }
+
+    static void setConnectionListener(ConnectionListener l) { connectionListener = l; }
+
+    static TdApi.ConnectionState connectionState() { return connectionState; }
+
+    /** True when TDLib can talk to the server. */
+    static boolean isReady() {
+        return connectionState instanceof TdApi.ConnectionStateReady;
+    }
 
     /**
      * The "online" option tells TDLib whether the user is actively present.
@@ -115,6 +131,18 @@ public final class Td {
             } else if (object instanceof TdApi.UpdateChatLastMessage) {
                 MainActivity a = chatList;
                 if (a != null) a.onChatUpdated(((TdApi.UpdateChatLastMessage) object).chatId);
+
+            } else if (object instanceof TdApi.UpdateConnectionState) {
+                TdApi.ConnectionState st = ((TdApi.UpdateConnectionState) object).state;
+                connectionState = st;
+                ConnectionListener l = connectionListener;
+                if (l != null) l.onConnectionState(st);
+
+            } else if (object instanceof TdApi.UpdateFile) {
+                TdApi.UpdateFile u = (TdApi.UpdateFile) object;
+                MediaLoader.get().onFileUpdated(u.file);
+                ChatActivity c = conversation;
+                if (c != null) c.onFileUpdated(u.file);
 
             } else if (object instanceof TdApi.UpdateUser) {
                 TdApi.UpdateUser u = (TdApi.UpdateUser) object;
