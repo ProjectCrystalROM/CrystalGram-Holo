@@ -1,23 +1,67 @@
-// Root project. Kept deliberately minimal: no Kotlin, no AndroidX, no
-// Material Components, no Compose. Everything builds on Gradle 7.6.3 +
-// AGP 7.4.2 targeting minSdkVersion 16 (Android 4.1 Jelly Bean).
-buildscript {
-    repositories {
-        google()
-        mavenCentral()
+apply plugin: 'com.android.application'
+
+// Telegram API credentials come from local.properties (git-ignored), never from
+// source. Read here at configure time and baked into BuildConfig.
+def localProps = new Properties()
+def localFile = rootProject.file('local.properties')
+if (localFile.exists()) {
+    localFile.withInputStream { localProps.load(it) }
+}
+def tgApiId = (localProps.getProperty('api_id') ?: '0').trim()
+def tgApiHash = (localProps.getProperty('api_hash') ?: '').trim()
+
+android {
+    compileSdk 34
+    ndkVersion '23.2.8568313'
+    buildToolsVersion '34.0.0'
+
+    defaultConfig {
+        applicationId "ai.crystalgram.holo"
+        minSdkVersion 16
+        targetSdkVersion 34
+        versionCode 1
+        versionName "0.2-auth"
+
+        buildConfigField "int", "TG_API_ID", tgApiId
+        buildConfigField "String", "TG_API_HASH", "\"${tgApiHash}\""
     }
-    dependencies {
-        classpath 'com.android.tools.build:gradle:7.4.2'
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    /**
+     * Diagnostics are a build-time decision, not a runtime flag.
+     *
+     * debug: tracing on, TDLib verbose enough to be useful, per-render trace
+     *        lines written to a file (the only instrument that works here -
+     *        logcat is a 256 KB ring TDLib fills within seconds).
+     * release: all of it compiled out. The compiler drops the branches, so a
+     *        shipped build carries no trace strings and does no file writes
+     *        on the notification path.
+     */
+    buildTypes {
+        debug {
+            buildConfigField "boolean", "DIAGNOSTICS", "true"
+        }
+        release {
+            buildConfigField "boolean", "DIAGNOSTICS", "false"
+            minifyEnabled false
+        }
+    }
+
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    lint {
+        abortOnError false
     }
 }
 
-allprojects {
-    repositories {
-        google()
-        mavenCentral()
-    }
-}
-
-tasks.register('clean', Delete) {
-    delete rootProject.buildDir
+dependencies {
+    // Framework UI only: android.app / android.widget / android.view, Theme.Holo.
+    // Nothing from AndroidX, Material or Compose.
 }

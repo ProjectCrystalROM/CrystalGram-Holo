@@ -77,7 +77,28 @@ public final class Td {
         c.send(query, handler);
     }
 
-    static void setNotifier(NotificationService s) { notifier = s; }
+    static void setNotifier(NotificationService s) {
+        notifier = s;
+        trace("setNotifier " + (s != null ? "attached" : "cleared"));
+    }
+
+    /**
+     * Appends a diagnostic line to a file.
+     *
+     * logcat on this device is a 256 KB ring that TDLib fills within seconds,
+     * so anything the app logs is evicted before it can be read. A file
+     * survives, and is the only reliable way to see what TDLib is dispatching.
+     */
+    private static void trace(String line) {
+        try {
+            java.io.File f = new java.io.File(
+                    android.os.Environment.getDataDirectory(), "data/ai.crystalgram.holo");
+            // Cannot write another app's dir; the service appends instead.
+            NotificationService.traceLine(line);
+        } catch (Throwable ignored) {
+            // never let diagnostics break the dispatcher
+        }
+    }
 
     static void setConnectionListener(ConnectionListener l) { connectionListener = l; }
 
@@ -150,6 +171,9 @@ public final class Td {
 
             } else if (object instanceof TdApi.UpdateNotificationGroup) {
                 TdApi.UpdateNotificationGroup u = (TdApi.UpdateNotificationGroup) object;
+                trace("UpdateNotificationGroup group=" + u.notificationGroupId
+                        + " added=" + u.addedNotifications.length
+                        + " notifier=" + (notifier != null));
                 if (notifier != null) notifier.onNotificationGroup(u);
 
             } else if (object instanceof TdApi.UpdateNotification) {
