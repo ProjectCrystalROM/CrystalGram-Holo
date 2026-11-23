@@ -76,6 +76,7 @@ api_hash=0123456789abcdef0123456789abcdef
 
 Application source: to be decided.
 
-The bundled native libraries in `app/src/main/jniLibs/armeabi-v7a/` are TDLib
-and unrelated to this application's own code; see [NATIVE.md](NATIVE.md) for
-where they came from and the terms that apply to them.
+The bundled native library in `app/src/main/jniLibs/armeabi-v7a/` is TDLib,
+built from upstream source by this project and unrelated to this application's
+own code; see [NATIVE.md](NATIVE.md) for how it is built, why the commit is
+pinned, and the terms that apply to it.

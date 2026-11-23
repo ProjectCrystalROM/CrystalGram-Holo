@@ -1,57 +1,113 @@
-# Bundled native libraries
+# Bundled native library
 
-`app/src/main/jniLibs/armeabi-v7a/` contains three `.so` files that this project
-did not compile itself. They must ship together: the Java classes and the
-native library check each other's version at load time.
+`app/src/main/jniLibs/armeabi-v7a/libtdjni.so` is built by this project from
+TDLib source. It is the only `.so` the app ships: OpenSSL and the C++ runtime
+are linked into it statically, so there is no `libsslx.so`, `libcryptox.so` or
+`libc++_shared.so` to keep in step.
 
-| File | Size | Version |
+| File | Size | Built from |
 |---|---|---|
-| `libtdjni.so` | ~15 MB | TDLib 1.8.67 |
-| `libsslx.so` | ~584 KB | OpenSSL |
-| `libcryptox.so` | ~2.8 MB | OpenSSL |
+| `libtdjni.so` | ~17 MB | TDLib `42e6a5259551178d1dab54a22ad96d14bd906e20` |
 
-## Where they came from
+## The commit must not change
 
-Extracted from the last public Telegram X release that still supports API 16.
-TDLib 1.8.67 was confirmed by asking the loaded library for its version at
-runtime rather than by guessing.
+TDLib's `JNI_OnLoad` compares a hash baked into the generated `TdApi.java`
+against one baked into the native library and **aborts the process** on a
+mismatch. There is no exception to catch and nothing in logcat beyond the
+library loading.
 
-The corresponding TDLib commit is:
+`TdApi.java` in this repository was generated from the source tree at exactly
+`42e6a5259551178d1dab54a22ad96d14bd906e20`. Regenerating it at a different
+commit means rebuilding the library in the same pass — never one without the
+other.
 
+## How it is built
+
+Two stages. This is upstream's method (`example/android/build-tdlib.sh`), and
+the two-stage split is not optional: TDLib's CMake skips every source-generation
+rule when cross-compiling, because the generators are host executables it cannot
+run for the target. Skipping stage 1 means the cross build fails partway through
+looking for a generated file that nothing will produce.
+
+**Stage 1 — generate sources natively.**
+
+```sh
+mkdir build-native && cd build-native
+cmake .. -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DTD_GENERATE_SOURCE_FILES=ON \
+  -DTD_ENABLE_JNI=ON
+cmake --build . -j"$(nproc)"
 ```
-42e6a5259551178d1dab54a22ad96d14bd906e20
+
+`-DTD_ENABLE_JNI=ON` is the flag that is easy to miss and expensive to debug
+without: `td/generate/CMakeLists.txt` only defines `TD_ENABLE_JNI=1` for the
+`generate_common` target when it is set, so without it `td_api.h` is emitted
+without `get_package_name_ref`, `get_git_commit_hash` or `Function::fetch` —
+and `td_jni.cpp` then fails to compile with seven errors about missing members.
+The header is regenerated and looks plausible; only those symbols are absent.
+
+**Stage 2 — cross-compile the target.**
+
+```sh
+mkdir build && cd build
+cmake ../../tdlib-src/example/android -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=armeabi-v7a \
+  -DANDROID_PLATFORM=android-16 \
+  -DANDROID_STL=c++_static \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DOPENSSL_ROOT_DIR="$OPENSSL" \
+  -DOPENSSL_USE_STATIC_LIBS=TRUE
+cmake --build . --target tdjni -j"$(nproc)"
 ```
 
-That commit matters. TDLib's `JNI_OnLoad` compares a hash baked into the
-generated `TdApi.java` against one baked into the native library, and **aborts
-the process** on a mismatch. There is no exception to catch. `TdApi.java` in
-this repository was therefore generated from the source tree at exactly that
-commit, so the two hashes agree on their own terms. Do not regenerate
-`TdApi.java` from a different TDLib version unless you also rebuild the
-libraries.
+`android-16` matches `minSdkVersion`. TDLib's default is newer, and building
+against it produces calls that will not resolve on Jelly Bean. `c++_static`
+avoids shipping a second shared library.
+
+`scripts/build-tdlib-android.sh` runs both stages and refuses to start if the
+source tree is not at the expected commit.
+
+## Toolchain used
+
+| Component | Version |
+|---|---|
+| NDK | 23.2.8568313 |
+| CMake | 3.31.6 (upstream pins 3.22.1; the SDK here ships neither) |
+| OpenSSL | 1.1.1w, `no-asm`, static, `android-16/armeabi-v7a` |
+| Generator | Ninja 1.13.2 |
+
+Upstream's `build-openssl.sh` builds OpenSSL 1.1.1 by default for the same
+reason this project does: much smaller binary and better performance on this
+hardware than 3.x. `no-asm` is required — the ARM assembly paths do not build
+under NDK 23 for this target.
+
+## Why it is committed
+
+17 MB of build output in git is real weight. It is committed so that a clone
+builds and runs without first reproducing a native toolchain, and because the
+alternative — a binary host that can be lost — is worse.
+
+To verify a committed library matches its stated source:
+
+```sh
+llvm-nm -D --defined-only libtdjni.so | grep JNI_OnLoad
+llvm-readelf -d libtdjni.so | grep NEEDED
+```
+
+`NEEDED` should list only `liblog`, `libdl`, `libz`, `libm` and `libc`. A
+`libsslx.so`, `libcryptox.so` or `libc++_shared.so` there means the static
+link did not take.
+
+There are no `Java_org_drinkless_tdlib_*` symbols in either a correct or an
+incorrect build: `td_jni.cpp` registers its native methods dynamically in
+`JNI_OnLoad` via `RegisterNatives`. `JNI_OnLoad` being present is the whole
+check at the symbol level; whether the version hash agrees can only be proven
+on a device.
+
+## Licensing
 
 Upstream TDLib is Apache-2.0. OpenSSL 1.1.1 is under the OpenSSL/SSLeay licence.
-Telegram X's own application code is not included — only the TDLib build
-products.
-
-## Why they are committed
-
-Two reasons, both temporary:
-
-1. They are currently the only copy. Rebuilding TDLib for armv7 against this
-   toolchain has not been done yet, so losing these files would set the project
-   back significantly.
-2. A clone should build and run without first reproducing a TDLib build.
-
-15 MB of someone else's build artifact in git is real weight, and this is
-intended to go away. The plan is to replace them with libraries this project
-builds from `42e6a525`, at which point they can be deleted and the build
-documented instead.
-
-## Rebuilding instead
-
-The intended path is a cross-compile of TDLib for `armeabi-v7a` at API 16 with
-OpenSSL 1.1.1w built `no-asm` and static. The stub generator steps
-(`generate_common`, `generate_mtproto`, `generate_c`, `generate_json`) must run
-on the host, because TDLib's CMake skips them when cross-compiling. See
-`scripts/` for the OpenSSL side of that work.
+No application code from Telegram X or the official Telegram client is included
+or was ever compiled in.
