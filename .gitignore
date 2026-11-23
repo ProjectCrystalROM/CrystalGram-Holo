@@ -8,12 +8,22 @@ build/
 *.class
 
 # Local machine configuration and secrets.
-# local.properties holds sdk.dir plus the Telegram api_id / api_hash and must
-# never be committed. See app/app/build.gradle and BUILDING.md.
+# local.properties holds sdk.dir, the Telegram api_id / api_hash, and the
+# release keystore path/password/alias. None of it may be committed.
+# See app/build.gradle.
 local.properties
+
+# Signing material. The release key is PKCS12; the others are listed so an
+# old or alternative keystore can never be committed by accident. Losing this
+# file means no future update can install over an existing copy of the app.
 *.keystore
 *.jks
 *.p12
+*.p12.tmp
+
+# Gradle's own signing cache and any local key backups
+*.bks
+signing/
 
 # Native build trees and downloaded toolchains (large, reproducible)
 .tools/
