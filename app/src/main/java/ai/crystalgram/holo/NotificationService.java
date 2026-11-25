@@ -211,6 +211,14 @@ public class NotificationService extends Service {
         }
     }
 
+    void onTermsGateChanged() {
+        synchronized (groups) {
+            if (destroyed) return;
+            for (TdApi.NotificationGroup group : groups.values()) render(group, false);
+        }
+        if (Td.authorized()) onAuthorized();
+    }
+
     void onChatScopeChanged(long chatId) {
         synchronized (groups) {
             if (destroyed) return;
@@ -231,7 +239,7 @@ public class NotificationService extends Service {
     private void render(TdApi.NotificationGroup g, boolean alert) {
         TdApi.Chat chat = Td.chat(g.chatId);
         ChatScope scope = Td.scope(chat);
-        if (scope == ChatScope.EXCLUDED) {
+        if (scope == ChatScope.EXCLUDED || Td.termsBlocked()) {
             nm.cancel(MESSAGE_TAG, g.id);
             return;
         }
@@ -294,35 +302,29 @@ public class NotificationService extends Service {
     private String titleFor(TdApi.NotificationGroup g) {
         if (g.type instanceof TdApi.NotificationGroupTypeMessages) {
             TdApi.Chat c = Td.chat(g.chatId);
-            if (c != null && c.title != null && c.title.length() > 0) return c.title;
+            if (c != null) return Td.chatTitle(c);
             return "New message";
         }
         if (g.type instanceof TdApi.NotificationGroupTypeSecretChat) return "Secret chat";
         return "CrystalGram";
     }
 
-    /**
-     * NotificationType carries either a full Message (new message) or a
-     * PushMessageContent (push message). Both are rendered here; anything else
-     * (incoming call, secret chat) gets a plain line rather than being dropped.
-     */
-    private String textFor(TdApi.Notification n) {
+    static String textFor(TdApi.Notification n) {
         if (n.type instanceof TdApi.NotificationTypeNewMessage) {
-            TdApi.Message m = ((TdApi.NotificationTypeNewMessage) n.type).message;
-            return m == null ? "New message" : contentText(m.content);
+            TdApi.NotificationTypeNewMessage update = (TdApi.NotificationTypeNewMessage) n.type;
+            if (update.showPreview && update.message != null) return contentText(update.message.content);
+            return "New message";
         }
-        if (n.type instanceof TdApi.NotificationTypeNewPushMessage) {
-            return pushText(((TdApi.NotificationTypeNewPushMessage) n.type).content);
-        }
+        // Push-only updates have no explicit preview permission in the pinned schema.
         if (n.type instanceof TdApi.NotificationTypeNewSecretChat) return "New secret chat";
         if (n.type instanceof TdApi.NotificationTypeNewCall) return "Incoming call";
         return "New message";
     }
 
-    private String contentText(TdApi.MessageContent c) {
+    private static String contentText(TdApi.MessageContent c) {
         if (c instanceof TdApi.MessageText) {
-            String t = ((TdApi.MessageText) c).text.text;
-            return t == null ? "" : t;
+            TdApi.FormattedText text = ((TdApi.MessageText) c).text;
+            return text == null || text.text == null || text.text.isEmpty() ? "New message" : text.text;
         }
         if (c instanceof TdApi.MessagePhoto) return "Photo";
         if (c instanceof TdApi.MessageVideo) return "Video";
@@ -333,23 +335,6 @@ public class NotificationService extends Service {
         if (c instanceof TdApi.MessageContact) return "Contact";
         if (c instanceof TdApi.MessagePoll) return "Poll";
         return "Message";
-    }
-
-    private String pushText(TdApi.PushMessageContent c) {
-        if (c instanceof TdApi.PushMessageContentText) {
-            String t = ((TdApi.PushMessageContentText) c).text;
-            return t == null ? "" : t;
-        }
-        if (c instanceof TdApi.PushMessageContentPhoto) return "Photo";
-        if (c instanceof TdApi.PushMessageContentVideo) return "Video";
-        if (c instanceof TdApi.PushMessageContentVoiceNote) return "Voice message";
-        if (c instanceof TdApi.PushMessageContentSticker) return "Sticker";
-        if (c instanceof TdApi.PushMessageContentDocument) return "Document";
-        if (c instanceof TdApi.PushMessageContentAnimation) return "GIF";
-        if (c instanceof TdApi.PushMessageContentHidden) return "Message";
-        if (c instanceof TdApi.PushMessageContentContact) return "Contact";
-        if (c instanceof TdApi.PushMessageContentPoll) return "Poll";
-        return "New message";
     }
 
     static final String ACTION_DISMISS = "ai.crystalgram.holo.DISMISS";

@@ -40,11 +40,13 @@ public class LoginActivity extends Activity {
     static final String NOTIFICATION_ENTRY = "ai.crystalgram.holo.NotificationEntry";
 
     private boolean resumed;
+    private android.app.AlertDialog termsDialog;
+    private String termsDialogId;
     private TdApi.AuthorizationState state;
     private final Handler ui = new Handler(Looper.getMainLooper());
 
     /** What the current input field expects. */
-    private enum Step { NONE, PHONE, CODE, PASSWORD, EMAIL, EMAIL_CODE, FIRST_NAME, LAST_NAME }
+    private enum Step { NONE, PHONE, CODE, PASSWORD, EMAIL, EMAIL_CODE }
 
     private Step step = Step.NONE;
 
@@ -123,6 +125,7 @@ public class LoginActivity extends Activity {
 
     @Override protected void onDestroy() {
         destroyed = true;
+        dismissTermsDialog();
         ui.removeCallbacksAndMessages(null);
         super.onDestroy();
     }
@@ -152,12 +155,10 @@ public class LoginActivity extends Activity {
         spinner.setVisibility(View.VISIBLE);
     }
 
-    private String firstName;
-
     private void submit() {
         String value = field.getText().toString();
         if (step != Step.PASSWORD) value = value.trim();
-        if (value.length() == 0 && step != Step.LAST_NAME) return;
+        if (value.length() == 0) return;
 
         TdApi.Function<?> request;
         switch (step) {
@@ -168,11 +169,6 @@ public class LoginActivity extends Activity {
             case EMAIL_CODE:
                 request = new TdApi.CheckAuthenticationEmailCode(new TdApi.EmailAddressAuthenticationCode(value));
                 break;
-            case FIRST_NAME:
-                firstName = value;
-                ask(Step.LAST_NAME, "Enter your last name (optional):", "Last name", InputType.TYPE_CLASS_TEXT);
-                return;
-            case LAST_NAME: request = new TdApi.RegisterUser(firstName, value, false); break;
             default: return;
         }
         busy("Contacting Telegram\u2026");
@@ -199,6 +195,7 @@ public class LoginActivity extends Activity {
 
     void onAuthorizationState(TdApi.AuthorizationState next) {
         state = next;
+        if (!(next instanceof TdApi.AuthorizationStateReady)) dismissTermsDialog();
         if (next instanceof TdApi.AuthorizationStateWaitTdlibParameters) {
             busy("Setting up\u2026");
         } else if (next instanceof TdApi.AuthorizationStateWaitPhoneNumber) {
@@ -215,11 +212,14 @@ public class LoginActivity extends Activity {
         } else if (next instanceof TdApi.AuthorizationStateWaitEmailCode) {
             ask(Step.EMAIL_CODE, "Enter the code Telegram emailed you:", "Code", InputType.TYPE_CLASS_TEXT);
         } else if (next instanceof TdApi.AuthorizationStateWaitRegistration) {
-            TdApi.TermsOfService terms = ((TdApi.AuthorizationStateWaitRegistration) next).termsOfService;
-            String prompt = terms == null || terms.text == null ? "" : terms.text.text + "\n\n";
-            ask(Step.FIRST_NAME, prompt + "Enter your first name to register:", "First name", InputType.TYPE_CLASS_TEXT);
+            ask(Step.PHONE, getString(R.string.login_existing_account_only),
+                    "+1 555 123 4567", InputType.TYPE_CLASS_PHONE);
         } else if (next instanceof TdApi.AuthorizationStateReady) {
             if (!resumed || isFinishing()) return;
+            if (Td.termsBlocked()) {
+                showPendingTerms();
+                return;
+            }
             if (android.os.Build.VERSION.SDK_INT >= 33
                     && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
                     != android.content.pm.PackageManager.PERMISSION_GRANTED
@@ -245,7 +245,41 @@ public class LoginActivity extends Activity {
         if (requestCode == 1 && Td.authorized() && !isFinishing()) enterApp();
     }
 
+    void showPendingTerms() {
+        if (!resumed || isFinishing() || !Td.sessionReady() || !Td.termsBlocked()) return;
+        AccountTerms gate = Td.accountTerms();
+        AccountTerms.Notice notice = gate.pending();
+        if (termsDialog != null && termsDialog.isShowing() && notice.id.equals(termsDialogId)) return;
+        dismissTermsDialog();
+        busy("Review Telegram’s updated terms to continue.");
+        spinner.setVisibility(View.GONE);
+        termsDialogId = notice.id;
+        termsDialog = gate.createDialog(this, notice);
+        termsDialog.show();
+    }
+
+    private void dismissTermsDialog() {
+        if (termsDialog != null) {
+            termsDialog.dismiss();
+            termsDialog = null;
+        }
+    }
+
+    void waitForAccountDeletion() {
+        dismissTermsDialog();
+        if (!isFinishing() && Td.sessionReady()) busy("Waiting for Telegram to close the account…");
+    }
+
+    void resumeAfterTerms() {
+        dismissTermsDialog();
+        if (resumed && !isFinishing() && Td.authorized()) onAuthorizationState(state);
+    }
+
     private void enterApp() {
+        if (!Td.authorized()) {
+            showPendingTerms();
+            return;
+        }
         NotificationService.start(this);
         Intent destination = new Intent(this, MainActivity.class);
         if (getComponentName().getClassName().equals(NOTIFICATION_ENTRY)

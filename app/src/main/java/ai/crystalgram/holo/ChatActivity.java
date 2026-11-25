@@ -59,6 +59,14 @@ public class ChatActivity extends Activity {
     private long chatId;
     static final String EXTRA_TOPIC_ID = "forumTopicId";
     private int topicId;
+    private long lastReadOutboxId;
+    private long peerId;
+    private TextView replyBanner;
+    private long replyMessageId;
+    private TdApi.UserStatus peerStatus;
+    private final Runnable refreshPresence = () -> showPresence(peerStatus);
+    private MediaViewer viewer;
+    private final Runnable expireMessages = () -> this.adapter.expireDue();
     private TdApi.ForumTopicInfo topicInfo;
     private Button sendButton;
     private String chatTitle;
@@ -136,6 +144,11 @@ public class ChatActivity extends Activity {
         typingLabel.setVisibility(View.GONE);
         root.addView(typingLabel);
 
+        replyBanner = new TextView(this);
+        replyBanner.setPadding(dp(10), dp(6), dp(10), dp(6));
+        replyBanner.setVisibility(View.GONE);
+        replyBanner.setOnClickListener(v -> clearReply());
+        root.addView(replyBanner);
         LinearLayout entry = new LinearLayout(this);
         entry.setOrientation(LinearLayout.HORIZONTAL);
         entry.setGravity(Gravity.CENTER_VERTICAL);
@@ -179,6 +192,7 @@ public class ChatActivity extends Activity {
             finish();
             return;
         }
+        Td.bindConversation(this);
         final int request = historyGeneration;
         Td.resolveChat(chatId, chat -> ui.post(() -> {
             if (isFinishing() || request != historyGeneration) return;
@@ -192,9 +206,12 @@ public class ChatActivity extends Activity {
                 unavailable();
                 return;
             }
-            chatTitle = chat.title;
+            chatTitle = Td.chatTitle(chat);
+            peerId = chat.type instanceof TdApi.ChatTypePrivate ? ((TdApi.ChatTypePrivate) chat.type).userId : 0;
             if (topicId == 0) {
+                advanceReadOutbox(chat.lastReadOutboxMessageId);
                 setTitle(chatTitle);
+                loadPresence();
                 openHistory();
                 return;
             }
@@ -204,15 +221,174 @@ public class ChatActivity extends Activity {
                     unavailable();
                     return;
                 }
-                TdApi.ForumTopicInfo info = ((TdApi.ForumTopic) result).info;
+                TdApi.ForumTopic forumTopic = (TdApi.ForumTopic) result;
+                TdApi.ForumTopicInfo info = forumTopic.info;
                 if (info == null || info.chatId != chatId || info.forumTopicId != topicId) {
                     unavailable();
                     return;
                 }
+                advanceReadOutbox(forumTopic.lastReadOutboxMessageId);
                 applyTopicInfo(info);
                 openHistory();
             }));
         }));
+    }
+
+    private void loadPresence() {
+        if (peerId == 0) return;
+        TdApi.User cached = Td.user(peerId);
+        if (cached != null) showPresence(cached.status);
+        Td.send(new TdApi.GetUser(peerId), result -> {
+            if (result instanceof TdApi.User) {
+                TdApi.User user = (TdApi.User) result;
+                onPresence(user.id, user.status);
+                ui.post(() -> { if (!isFinishing()) invalidateOptionsMenu(); });
+            }
+        });
+    }
+
+    void onPresence(long userId, TdApi.UserStatus status) {
+        ui.post(() -> {
+            if (userId == peerId && resumed && !isFinishing()) showPresence(status);
+        });
+    }
+
+    private void showPresence(TdApi.UserStatus status) {
+        peerStatus = status;
+        ui.removeCallbacks(refreshPresence);
+        if (getActionBar() == null || peerId == 0 || peerId == Td.me()) return;
+        TdApi.User user = Td.user(peerId);
+        String subtitle = null;
+        long now = System.currentTimeMillis();
+        if (user != null && user.type instanceof TdApi.UserTypeBot) subtitle = "Bot";
+        else if (status instanceof TdApi.UserStatusOnline) {
+            long expiry = 1000L * ((TdApi.UserStatusOnline) status).expires;
+            if (expiry > now) {
+                subtitle = "Online";
+                ui.postDelayed(refreshPresence, expiry - now);
+            } else subtitle = "Last seen recently";
+        } else if (status instanceof TdApi.UserStatusOffline) {
+            long last = 1000L * ((TdApi.UserStatusOffline) status).wasOnline;
+            if (last > 0) subtitle = "Last seen " + android.text.format.DateUtils.getRelativeTimeSpanString(last);
+        } else if (status instanceof TdApi.UserStatusRecently) subtitle = "Last seen recently";
+        else if (status instanceof TdApi.UserStatusLastWeek) subtitle = "Last seen within a week";
+        else if (status instanceof TdApi.UserStatusLastMonth) subtitle = "Last seen within a month";
+        getActionBar().setSubtitle(subtitle);
+    }
+
+    private void showBotCommands() {
+        TdApi.Chat chat = Td.chat(chatId);
+        if (!canCompose() || chat == null) return;
+        TdApi.Function<?> query;
+        if (chat.type instanceof TdApi.ChatTypeBasicGroup) {
+            query = new TdApi.GetBasicGroupFullInfo(((TdApi.ChatTypeBasicGroup) chat.type).basicGroupId);
+        } else if (chat.type instanceof TdApi.ChatTypeSupergroup) {
+            query = new TdApi.GetSupergroupFullInfo(((TdApi.ChatTypeSupergroup) chat.type).supergroupId);
+        } else if (peerId != 0) {
+            query = new TdApi.GetUserFullInfo(peerId);
+        } else return;
+        Td.send(query, result -> ui.post(() -> {
+            if (!canCompose()) return;
+            if (result instanceof TdApi.Error) {
+                ConversationActions.toast(this, ((TdApi.Error) result).message);
+                return;
+            }
+            java.util.ArrayList<String> commands = new java.util.ArrayList<>();
+            java.util.ArrayList<String> labels = new java.util.ArrayList<>();
+            if (result instanceof TdApi.UserFullInfo) {
+                TdApi.BotInfo bot = ((TdApi.UserFullInfo) result).botInfo;
+                if (bot != null) addCommands(commands, labels, bot.commands, "");
+            } else {
+                TdApi.BotCommands[] groups = result instanceof TdApi.BasicGroupFullInfo
+                        ? ((TdApi.BasicGroupFullInfo) result).botCommands
+                        : result instanceof TdApi.SupergroupFullInfo
+                            ? ((TdApi.SupergroupFullInfo) result).botCommands : null;
+                if (groups != null) {
+                    for (TdApi.BotCommands group : groups) {
+                        TdApi.User bot = Td.user(group.botUserId);
+                        if (bot != null && bot.usernames != null && bot.usernames.activeUsernames != null
+                                && bot.usernames.activeUsernames.length != 0) {
+                            addCommands(commands, labels, group.commands, "@" + bot.usernames.activeUsernames[0]);
+                        }
+                    }
+                }
+            }
+            if (commands.isEmpty()) {
+                ConversationActions.toast(this, "No command list is available. You can type a slash command.");
+                return;
+            }
+            new android.app.AlertDialog.Builder(this).setTitle("Bot commands")
+                    .setItems(labels.toArray(new String[0]), (d, i) -> {
+                        input.setText(commands.get(i));
+                        input.setSelection(input.length());
+                        input.requestFocus();
+                    }).show();
+        }));
+    }
+
+    private static void addCommands(List<String> values, List<String> labels,
+                                    TdApi.BotCommand[] commands, String suffix) {
+        if (commands == null) return;
+        for (TdApi.BotCommand command : commands) {
+            String value = "/" + command.command + suffix;
+            values.add(value);
+            labels.add(value + " · " + command.description);
+        }
+    }
+
+    boolean canUse(TdApi.Message message) {
+        return resumed && !isFinishing() && Td.authorized() && Td.scope(chatId).allowsHistory(topicId)
+                && ChatScope.matches(chatId, topicId, message)
+                && !adapter.deleted.contains(message.id);
+    }
+
+    boolean canCompose() { return resumed && !isFinishing() && maySend(); }
+
+    void replyTo(TdApi.Message message) {
+        if (!canCompose() || !canUse(message)) return;
+        replyMessageId = message.id;
+        String summary = MainActivity.ChatRow.previewOf(message);
+        replyBanner.setText(summary.length() == 0 ? "Replying · Tap to cancel"
+                : "Replying to " + summary + " · Tap to cancel");
+        replyBanner.setMaxLines(2);
+        replyBanner.setVisibility(View.VISIBLE);
+        input.requestFocus();
+    }
+
+    private void clearReply() {
+        replyMessageId = 0;
+        replyBanner.setVisibility(View.GONE);
+    }
+
+    private TdApi.InputMessageReplyTo reply(long id) {
+        return id == 0 ? null : new TdApi.InputMessageReplyToMessage(id, null, 0, "");
+    }
+
+    void onMessageEdited(TdApi.UpdateMessageEdited update) {
+        if (update.chatId != chatId) return;
+        ui.post(() -> {
+            for (TdApi.Message message : adapter.items) {
+                if (message.id == update.messageId) {
+                    message.replyMarkup = update.replyMarkup;
+                    message.editDate = update.editDate;
+                    adapter.notifyDataSetChanged();
+                    return;
+                }
+            }
+        });
+    }
+
+    void onInteractionInfo(TdApi.UpdateMessageInteractionInfo update) {
+        if (update.chatId != chatId) return;
+        ui.post(() -> {
+            for (TdApi.Message message : adapter.items) {
+                if (message.id == update.messageId) {
+                    message.interactionInfo = update.interactionInfo;
+                    adapter.notifyDataSetChanged();
+                    return;
+                }
+            }
+        });
     }
 
     private void unavailable() {
@@ -223,13 +399,12 @@ public class ChatActivity extends Activity {
     private void openHistory() {
         resumed = true;
         setComposerEnabled(maySend());
-        Td.bindConversation(this);
-        // The notification service can show unread messages in other forum topics.
-        Td.setOnline(topicId == 0);
+        Td.setOnline(true);
         Td.send(new TdApi.OpenChat(chatId));
         NotificationService.setOpenChat(chatId, topicId);
         MediaLoader.get().addListener(mediaListener);
         startNetworkWatch();
+        adapter.expireDue();
         loadHistory(0);
     }
 
@@ -264,6 +439,18 @@ public class ChatActivity extends Activity {
         });
     }
 
+    void onReadOutbox(long id, int updateTopicId, long lastReadId) {
+        if (id == chatId && updateTopicId == topicId) {
+            ui.post(() -> advanceReadOutbox(lastReadId));
+        }
+    }
+
+    private void advanceReadOutbox(long lastReadId) {
+        if (lastReadId <= lastReadOutboxId) return;
+        lastReadOutboxId = lastReadId;
+        adapter.notifyDataSetChanged();
+    }
+
     private TdApi.MessageTopic topic() {
         return topicId == 0 ? null : new TdApi.MessageTopicForum(topicId);
     }
@@ -277,6 +464,9 @@ public class ChatActivity extends Activity {
     @Override
     protected void onPause() {
         historyGeneration++;
+        if (viewer != null) viewer.close();
+        ui.removeCallbacks(expireMessages);
+        ui.removeCallbacks(refreshPresence);
         if (resumed) {
             resumed = false;
             setComposerEnabled(false);
@@ -347,16 +537,36 @@ public class ChatActivity extends Activity {
     }
 
     private static final int REQ_PICK = 1001;
+    private static final int[] MEDIA_TIMERS = {0, 5, 10, 30, 60};
 
     @Override
     public boolean onCreateOptionsMenu(android.view.Menu menu) {
-        if (resumed && maySend()) menu.add(0, 3, 0, "Attach");
+        if (resumed && maySend()) {
+            menu.add(0, 3, 0, "Attach");
+            TdApi.Chat chat = Td.chat(chatId);
+            if (chat != null && (chat.type instanceof TdApi.ChatTypeBasicGroup
+                    || chat.type instanceof TdApi.ChatTypeSupergroup)) {
+                menu.add(0, 4, 1, "Bot commands");
+            } else if (peerId != 0 && peerId != Td.me()) {
+                menu.add(0, 6, 1, "Attach disappearing media");
+            }
+        }
+        if (resumed) menu.add(0, 5, 2, "Chat settings");
         return true;
     }
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
-        if (item.getItemId() == 3 && resumed && maySend()) { pickFile(); return true; }
+        if (item.getItemId() == 3 && canCompose()) { pickFile(REQ_PICK, "*/*"); return true; }
+        if (item.getItemId() == 6 && canCompose() && peerId != 0 && peerId != Td.me()) {
+            chooseDisappearingMedia();
+            return true;
+        }
+        if (item.getItemId() == 4 && canCompose()) { showBotCommands(); return true; }
+        if (item.getItemId() == 5 && resumed) {
+            ChatSettings.show(this, chatId, new TdApi.ChatListMain(), () -> {});
+            return true;
+        }
         if (item.getItemId() == android.R.id.home) { finish(); return true; }
         return super.onOptionsItemSelected(item);
     }
@@ -366,10 +576,18 @@ public class ChatActivity extends Activity {
         String text = input.getText().toString();
         if (sendingText || text.trim().length() == 0) return;
         sendingText = true;
-        TdApi.InputMessageText content = new TdApi.InputMessageText();
-        content.text = new TdApi.FormattedText(text, null);
+        TdApi.TextEntity[] entities = null;
+        if (text.startsWith("/")) {
+            int end = 0;
+            while (end < text.length() && !Character.isWhitespace(text.charAt(end))) end++;
+            if (text.substring(0, end).matches("/[A-Za-z0-9_]{1,32}(@[A-Za-z0-9_]{1,32})?")) {
+                entities = new TdApi.TextEntity[] {new TdApi.TextEntity(0, end, new TdApi.TextEntityTypeBotCommand())};
+            }
+        }
+        TdApi.InputMessageText content = ConversationActions.text(text, entities);
+        final long sentReply = replyMessageId;
         final String draft = text;
-        Td.send(new TdApi.SendMessage(chatId, topic(), null,
+        Td.send(new TdApi.SendMessage(chatId, topic(), reply(sentReply),
                 new TdApi.MessageSendOptions(), null, content), new Client.ResultHandler() {
             @Override public void onResult(final TdApi.Object result) {
                 ui.post(new Runnable() {
@@ -382,6 +600,7 @@ public class ChatActivity extends Activity {
                         } else if (result instanceof TdApi.Message
                                 && draft.equals(input.getText().toString())) {
                             input.setText("");
+                            if (replyMessageId == sentReply) clearReply();
                         }
                     }
                 });
@@ -480,6 +699,9 @@ public class ChatActivity extends Activity {
             @Override public void run() {
                 for (TdApi.Message message : adapter.items) {
                     if (message.id == update.messageId) {
+                        if (viewer != null && MediaViewer.isExpired(update.newContent)) {
+                            viewer.expired(update.messageId);
+                        }
                         message.content = update.newContent;
                         adapter.notifyDataSetChanged();
                         break;
@@ -504,8 +726,13 @@ public class ChatActivity extends Activity {
                         adapter.deleted.add(id);
                     }
                 }
+                if (viewer != null) viewer.deleted(update.messageIds);
                 Set<Long> removed = new HashSet<>();
-                for (long id : update.messageIds) removed.add(id);
+                for (long id : update.messageIds) {
+                    removed.add(id);
+                    adapter.expiresAt.remove(id);
+                    if (replyMessageId == id) clearReply();
+                }
                 java.util.Iterator<TdApi.Message> messages = adapter.items.iterator();
                 while (messages.hasNext()) {
                     if (removed.contains(messages.next().id)) messages.remove();
@@ -608,6 +835,7 @@ public class ChatActivity extends Activity {
 
     private class MessageAdapter extends BaseAdapter {
         private final Set<Long> deleted = new HashSet<>();
+        private final java.util.Map<Long, Long> expiresAt = new java.util.HashMap<>();
         private final List<TdApi.Message> items = new ArrayList<TdApi.Message>();
         private final Set<Long> failed = new HashSet<Long>();
 
@@ -618,9 +846,13 @@ public class ChatActivity extends Activity {
             int before = items.size();
             for (TdApi.Message message : page) {
                 if (ChatScope.matches(chatId, topicId, message)
-                        && !deleted.contains(message.id) && known.add(message.id)) items.add(message);
+                        && !deleted.contains(message.id) && known.add(message.id)) {
+                    items.add(message);
+                    rememberExpiry(message);
+                }
             }
             if (items.size() != before) publish();
+            scheduleExpiry();
             return items.size() - before;
         }
 
@@ -645,8 +877,51 @@ public class ChatActivity extends Activity {
                 if (id == oldId || id == message.id) items.remove(i);
             }
             failed.remove(oldId);
+            if (oldId != message.id) expiresAt.remove(oldId);
+            if (deleted.contains(message.id)) {
+                publish();
+                return;
+            }
             items.add(message);
+            rememberExpiry(message);
+            scheduleExpiry();
             publish();
+        }
+
+        private void rememberExpiry(TdApi.Message message) {
+            if (message.autoDeleteIn <= 0) return;
+            long deadline = android.os.SystemClock.elapsedRealtime()
+                    + Math.max(1, (long) (message.autoDeleteIn * 1000));
+            Long old = expiresAt.get(message.id);
+            if (old == null || deadline < old) expiresAt.put(message.id, deadline);
+        }
+
+        private void scheduleExpiry() {
+            ui.removeCallbacks(expireMessages);
+            if (!resumed || expiresAt.isEmpty()) return;
+            long next = Long.MAX_VALUE;
+            for (long deadline : expiresAt.values()) next = Math.min(next, deadline);
+            ui.postDelayed(expireMessages, Math.max(0, next - android.os.SystemClock.elapsedRealtime()));
+        }
+
+        private void expireDue() {
+            long now = android.os.SystemClock.elapsedRealtime();
+            boolean changed = false;
+            java.util.Iterator<TdApi.Message> iterator = items.iterator();
+            while (iterator.hasNext()) {
+                TdApi.Message message = iterator.next();
+                Long deadline = expiresAt.get(message.id);
+                if (deadline != null && deadline <= now) {
+                    iterator.remove();
+                    expiresAt.remove(message.id);
+                    deleted.add(message.id);
+                    if (viewer != null) viewer.deleted(new long[] {message.id});
+                    if (replyMessageId == message.id) clearReply();
+                    changed = true;
+                }
+            }
+            if (changed) publish();
+            scheduleExpiry();
         }
 
         void markFailed(long id, String reason) {
@@ -658,16 +933,73 @@ public class ChatActivity extends Activity {
         @Override public Object getItem(int i) { return items.get(i); }
         @Override public long getItemId(int i) { return items.get(i).id; }
 
+        private String serviceText(TdApi.Message message) {
+            TdApi.Chat chat = Td.chat(chatId);
+            return ServiceMessage.describe(message.content, chat != null && chat.type instanceof TdApi.ChatTypeSecret);
+        }
+
+        @Override public int getViewTypeCount() { return 2; }
+
+        @Override public int getItemViewType(int position) {
+            return serviceText(items.get(position)) == null ? 0 : 1;
+        }
+
         @Override
         public View getView(int position, View convertView, ViewGroup parent) {
-            Row row = (convertView instanceof Row) ? (Row) convertView : new Row(ChatActivity.this);
             TdApi.Message m = items.get(position);
+            String event = serviceText(m);
+            if (event != null) {
+                TextView view = convertView instanceof TextView ? (TextView) convertView : new TextView(ChatActivity.this);
+                view.setText(event);
+                view.setGravity(Gravity.CENTER);
+                view.setTextSize(13);
+                view.setTextColor(Palette.PREVIEW);
+                view.setPadding(dp(18), dp(8), dp(18), dp(8));
+                view.setLayoutParams(new android.widget.AbsListView.LayoutParams(-1, -2));
+                return view;
+            }
+            Row row = (convertView instanceof Row) ? (Row) convertView : new Row(ChatActivity.this);
             boolean outgoing = m.isOutgoing;
             String text = textOf(m);
             String time = timeOf(m);
-            MediaVm media = MediaVm.of(m, MediaLoader.get());
-            row.bind(withTimestamp(text, time, outgoing, failed.contains(m.id) || m.sendingState instanceof TdApi.MessageSendingStateFailed),
-                    outgoing, media, iconFor(m));
+            boolean disappearing = MediaViewer.isProtected(m);
+            MediaVm media = disappearing ? null : MediaVm.of(m, MediaLoader.get());
+            if (disappearing) {
+                text = m.isOutgoing ? "Disappearing media sent" : "Disappearing media · Tap to view";
+            }
+            String reactions = ConversationActions.reactionsText(m);
+            if (reactions.length() != 0) text += "\n" + reactions;
+            if (m.replyTo instanceof TdApi.MessageReplyToMessage) {
+                TdApi.MessageReplyToMessage reply = (TdApi.MessageReplyToMessage) m.replyTo;
+                String excerpt = reply.content instanceof TdApi.MessageText
+                        ? ((TdApi.MessageText) reply.content).text.text : "Message";
+                if (excerpt.length() > 120) excerpt = excerpt.substring(0, 120) + "…";
+                text = "↪ " + excerpt + "\n" + text;
+            }
+            OutgoingReceipt receipt = OutgoingReceipt.of(m, failed.contains(m.id), lastReadOutboxId);
+            row.bind(withTimestamp(text, time, outgoing, receipt), outgoing, media, iconFor(m));
+            row.bubble.setOnLongClickListener(v -> {
+                ConversationActions.menu(ChatActivity.this, m);
+                return true;
+            });
+            row.bubble.setOnClickListener(null);
+            row.bubble.setClickable(false);
+            row.mediaBox.setOnClickListener(null);
+            row.mediaBox.setClickable(false);
+            if (m.content instanceof TdApi.MessageDocument) {
+                row.bubble.setOnClickListener(v -> DocumentViewer.open(ChatActivity.this, m));
+                row.mediaBox.setOnClickListener(v -> DocumentViewer.open(ChatActivity.this, m));
+            } else if (MediaViewer.canOpen(m)) {
+                View.OnClickListener open = v -> {
+                    if (!canUse(m)) return;
+                    if (viewer == null) viewer = new MediaViewer(ChatActivity.this, ui);
+                    viewer.open(m);
+                };
+                row.bubble.setOnClickListener(open);
+                row.mediaBox.setOnClickListener(open);
+            }
+            MessageWidgets.bind(ChatActivity.this, row.widgets, m);
+            row.widgets.setVisibility(row.widgets.getChildCount() == 0 ? View.GONE : View.VISIBLE);
             return row;
         }
 
@@ -682,6 +1014,10 @@ public class ChatActivity extends Activity {
         }
 
         private String textOf(TdApi.Message m) {
+            if (MediaViewer.isExpired(m.content)) return "Media expired";
+            if (m.content instanceof TdApi.MessagePoll) {
+                return MessageWidgets.pollText(((TdApi.MessagePoll) m.content).poll);
+            }
             if (m.content instanceof TdApi.MessageText) {
                 return ((TdApi.MessageText) m.content).text.text;
             }
@@ -697,7 +1033,12 @@ public class ChatActivity extends Activity {
                 return captionOf(((TdApi.MessageDocument) m.content).caption);
             }
             if (m.content instanceof TdApi.MessageSticker) return "";
-            if (m.content instanceof TdApi.MessageVoiceNote) return "";
+            if (m.content instanceof TdApi.MessageVoiceNote) return "Voice message · Tap to play";
+            if (m.content instanceof TdApi.MessageVideoNote) return "Video message · Tap to play";
+            if (m.content instanceof TdApi.MessageAudio) {
+                TdApi.Audio audio = ((TdApi.MessageAudio) m.content).audio;
+                return audio == null || audio.title == null || audio.title.isEmpty() ? "Audio · Tap to play" : audio.title;
+            }
             return "";
         }
 
@@ -715,10 +1056,21 @@ public class ChatActivity extends Activity {
 
     /**
      * Message text plus a timestamp on its own line: smaller, muted, aligned to
-     * the tail side. Failed sends get a marker appended.
+     * the tail side, with the outgoing receipt beside it.
      */
-    private CharSequence withTimestamp(String text, String time, boolean outgoing, boolean failed) {
-        String tail = time + (failed ? "  \u26a0 not sent" : "");
+    private CharSequence withTimestamp(String text, String time, boolean outgoing,
+                                       OutgoingReceipt receipt) {
+        int status;
+        switch (receipt) {
+            case SENDING: status = R.string.receipt_sending; break;
+            case SENT: status = R.string.receipt_sent; break;
+            case SEEN: status = R.string.receipt_seen; break;
+            case FAILED: status = R.string.receipt_failed; break;
+            case SCHEDULED: status = R.string.receipt_scheduled; break;
+            default: status = 0;
+        }
+        String tail = status == 0 ? time : getString(R.string.receipt_timestamp, time, getString(status));
+        boolean failed = receipt == OutgoingReceipt.FAILED;
         SpannableString s = new SpannableString(text + "\n" + tail);
         int start = text.length() + 1;
         s.setSpan(new RelativeSizeSpan(0.75f), start, s.length(),
@@ -739,6 +1091,7 @@ public class ChatActivity extends Activity {
         private final LinearLayout mediaBox;
         private final TextView mediaLabel;
         private final ProgressBar progress;
+        private final LinearLayout widgets;
 
         Row(Context ctx) {
             super(ctx);
@@ -780,6 +1133,10 @@ public class ChatActivity extends Activity {
             bubble.setTextColor(Palette.BUBBLE_TEXT);
             bubble.setPadding(dp(11), dp(7), dp(11), dp(7));
             column.addView(bubble);
+            widgets = new LinearLayout(ctx);
+            widgets.setOrientation(VERTICAL);
+            widgets.setVisibility(GONE);
+            column.addView(widgets);
 
             addView(column, new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -894,12 +1251,19 @@ public class ChatActivity extends Activity {
      * file managers and gallery apps actually present on Jelly Bean without
      * bundling a picker of our own.
      */
-    private void pickFile() {
+    private void chooseDisappearingMedia() {
+        String[] choices = {"View once", "5 seconds", "10 seconds", "30 seconds", "60 seconds"};
+        new android.app.AlertDialog.Builder(this).setTitle("Disappearing photo or video")
+                .setItems(choices, (d, i) -> pickFile(REQ_PICK + 1 + i, "*/*"))
+                .setNegativeButton(android.R.string.cancel, null).show();
+    }
+
+    private void pickFile(int request, String mimeType) {
         Intent i = new Intent(Intent.ACTION_GET_CONTENT);
-        i.setType("*/*");
+        i.setType(mimeType);
         i.addCategory(Intent.CATEGORY_OPENABLE);
         try {
-            startActivityForResult(i, REQ_PICK);
+            startActivityForResult(i, request);
         } catch (android.content.ActivityNotFoundException e) {
             Toast.makeText(this, "No file picker available", Toast.LENGTH_LONG).show();
         }
@@ -908,10 +1272,16 @@ public class ChatActivity extends Activity {
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
-        if (req != REQ_PICK || res != RESULT_OK || data == null) return;
+        if (req < REQ_PICK || req > REQ_PICK + MEDIA_TIMERS.length || res != RESULT_OK || data == null) return;
+        TdApi.MessageSelfDestructType ttl = null;
+        if (req != REQ_PICK) {
+            int seconds = MEDIA_TIMERS[req - REQ_PICK - 1];
+            ttl = seconds == 0 ? new TdApi.MessageSelfDestructTypeImmediately()
+                    : new TdApi.MessageSelfDestructTypeTimer(seconds);
+        }
         final Uri uri = data.getData();
         if (uri == null) return;
-        sendPicked(uri);
+        sendPicked(uri, ttl);
     }
 
     private String displayNameOf(Uri uri) {
@@ -941,7 +1311,8 @@ public class ChatActivity extends Activity {
      * All of it happens off the UI thread: a 3 MP decode is seconds of work on
      * a Cortex-A7 and would freeze the compose bar.
      */
-    private void sendPicked(final Uri uri) {
+    private void sendPicked(final Uri uri, final TdApi.MessageSelfDestructType ttl) {
+        final long attachedReply = replyMessageId;
         Toast.makeText(this, "Preparing\u2026", Toast.LENGTH_SHORT).show();
         new Thread(new Runnable() {
             @Override public void run() {
@@ -955,6 +1326,10 @@ public class ChatActivity extends Activity {
                                 .getMimeTypeFromExtension(name.substring(dot + 1).toLowerCase(java.util.Locale.US));
                     }
                     UploadPrep.Kind kind = UploadPrep.kindOf(mime);
+                    if (ttl != null && kind == UploadPrep.Kind.DOCUMENT) {
+                        ui.post(() -> { if (!isFinishing()) ConversationActions.toast(ChatActivity.this, "Choose a photo or video."); });
+                        return;
+                    }
 
                     // Prefer the file that already exists; copy only when the
                     // provider has nothing behind the URI.
@@ -986,7 +1361,7 @@ public class ChatActivity extends Activity {
                                         UploadPrep.sizeLabel(finalFile.length()) + " \u00b7 " + note,
                                         Toast.LENGTH_LONG).show();
                             }
-                            sendFile(finalFile, finalKind, dimensions);
+                            sendFile(finalFile, finalKind, dimensions, attachedReply, ttl);
                         }
                     });
                 } catch (final Exception t) {
@@ -1003,10 +1378,10 @@ public class ChatActivity extends Activity {
         }, "cg-upload").start();
     }
 
-    private void sendFile(File f, UploadPrep.Kind kind, int[] dim) {
+    private void sendFile(File f, UploadPrep.Kind kind, int[] dim, long attachedReply, TdApi.MessageSelfDestructType ttl) {
         // Only a file we copied is ours to delete; a Gallery file is the user's.
         final File tracked = UploadPrep.isStaged(this, f) ? f : null;
-        if (!maySend()) {
+        if (!maySend() || (ttl != null && (peerId == 0 || peerId == Td.me()))) {
             UploadCleanup.discard(tracked);
             if (!isFinishing()) Toast.makeText(this, R.string.forum_unavailable, Toast.LENGTH_SHORT).show();
             return;
@@ -1022,6 +1397,7 @@ public class ChatActivity extends Activity {
 
             TdApi.InputMessagePhoto m = new TdApi.InputMessagePhoto();
             m.photo = photo;
+            m.selfDestructType = ttl;
             m.caption = new TdApi.FormattedText("", null);
             content = m;
 
@@ -1032,6 +1408,7 @@ public class ChatActivity extends Activity {
 
             TdApi.InputMessageVideo m = new TdApi.InputMessageVideo();
             m.video = video;
+            m.selfDestructType = ttl;
             m.caption = new TdApi.FormattedText("", null);
             content = m;
 
@@ -1044,13 +1421,14 @@ public class ChatActivity extends Activity {
             content = m;
         }
 
-        Td.send(new TdApi.SendMessage(chatId, topic(), null,
+        Td.send(new TdApi.SendMessage(chatId, topic(), reply(attachedReply),
                 new TdApi.MessageSendOptions(), null, content),
                 new Client.ResultHandler() {
                     @Override public void onResult(TdApi.Object o) {
                         // The returned message carries the temporary id that
                         // UpdateMessageSendSucceeded will report as oldMessageId.
-                        if (o instanceof TdApi.Message && tracked != null) {
+                        if (o instanceof TdApi.Message) {
+                            ui.post(() -> { if (replyMessageId == attachedReply) clearReply(); });
                             UploadCleanup.track(chatId, ((TdApi.Message) o).id, tracked);
                         } else if (o instanceof TdApi.Error) {
                             UploadCleanup.discard(tracked);

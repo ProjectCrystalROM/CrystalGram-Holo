@@ -12,13 +12,26 @@ public final class ForumRoutingTest {
         TdApi.Supergroup group = new TdApi.Supergroup();
         group.id = 42;
 
-        ChatScope scope = ChatScope.of(type, group);
+        ChatScope scope = ChatScope.of(type, group, null);
         check(scope == ChatScope.CONVERSATION && scope.allowsHistory(0), "ordinary supergroup opens chat");
         check(!scope.allowsHistory(5), "ordinary supergroup cannot enter topic history");
-        check(ChatScope.of(new TdApi.ChatTypePrivate(), null) == ChatScope.CONVERSATION, "private chat");
+        TdApi.ChatTypePrivate privateChat = new TdApi.ChatTypePrivate(12);
+        TdApi.User peer = new TdApi.User();
+        peer.id = 12;
+        peer.type = new TdApi.UserTypeRegular();
+        check(ChatScope.of(privateChat, null, peer) == ChatScope.CONVERSATION, "human private chat");
+        peer.type = new TdApi.UserTypeDeleted();
+        check(ChatScope.of(privateChat, null, peer) == ChatScope.CONVERSATION, "deleted account chat");
+        peer.type = new TdApi.UserTypeBot();
+        check(ChatScope.of(privateChat, null, peer) == ChatScope.EXCLUDED, "private bot chat");
+        peer.type = new TdApi.UserTypeUnknown();
+        check(ChatScope.of(privateChat, null, peer) == ChatScope.EXCLUDED, "unknown private peer");
+        check(ChatScope.of(privateChat, null, null) == ChatScope.EXCLUDED, "uncached private peer");
+        check(ChatScope.of(new TdApi.ChatTypeBasicGroup(), null, null) == ChatScope.CONVERSATION,
+                "basic group remains available");
 
         group.isForum = true;
-        scope = ChatScope.of(type, group);
+        scope = ChatScope.of(type, group, null);
         check(scope == ChatScope.FORUM && !scope.allowsHistory(0), "forum opens its topic list");
         check(scope.allowsHistory(1) && scope.allowsHistory(5), "General and named topics open");
         check(!scope.allowsHistory(-1), "invalid topic ID");
@@ -67,7 +80,7 @@ public final class ForumRoutingTest {
     }
 
     private static void assertExcluded(TdApi.ChatType type, TdApi.Supergroup group) {
-        ChatScope scope = ChatScope.of(type, group);
+        ChatScope scope = ChatScope.of(type, group, null);
         check(scope == ChatScope.EXCLUDED && !scope.allowsHistory(0) && !scope.allowsHistory(5),
                 "excluded chat must not appear or open through chat or topic navigation");
     }

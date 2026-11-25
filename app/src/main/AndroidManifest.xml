@@ -62,6 +62,12 @@
             android:foregroundServiceType="remoteMessaging"
             android:exported="false" />
 
+        <provider
+            android:name=".DocumentProvider"
+            android:authorities="${applicationId}.documents"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
         <receiver android:name=".DismissReceiver" android:exported="false" />
 
         <activity

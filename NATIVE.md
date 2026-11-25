@@ -46,5 +46,6 @@ the API 18 in-place upgrade result.
 
 ## Licensing
 
-TDLib is licensed under the Boost Software License 1.0. The OpenSSL 3.5.9
+TDLib is licensed under the [Boost Software License 1.0](app/src/main/assets/licenses/LICENSE_1_0.txt).
+The OpenSSL 3.5.9
 Apache 2.0 license is included in `app/src/main/assets/licenses/OpenSSL.txt`.

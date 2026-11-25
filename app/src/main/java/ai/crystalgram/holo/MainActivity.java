@@ -40,6 +40,12 @@ public class MainActivity extends android.app.Activity {
     private TextView empty;
     private ChatListAdapter adapter;
     private boolean destroyed;
+    private boolean archive;
+    private final static String ARCHIVE_VIEW = "archivedChats";
+
+    private TdApi.ChatList chatList() {
+        return archive ? new TdApi.ChatListArchive() : new TdApi.ChatListMain();
+    }
 
     private final Handler ui = new Handler(Looper.getMainLooper());
 
@@ -47,8 +53,12 @@ public class MainActivity extends android.app.Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        archive = getIntent().getBooleanExtra(ARCHIVE_VIEW, false);
         android.app.ActionBar bar = getActionBar();
-        if (bar != null) bar.setTitle("CrystalGram");
+        if (bar != null) {
+            bar.setTitle(archive ? "Archived chats" : "CrystalGram");
+            bar.setDisplayHomeAsUpEnabled(archive);
+        }
 
         list = new ListView(this);
         list.setDivider(null);
@@ -64,6 +74,11 @@ public class MainActivity extends android.app.Activity {
                 i.putExtra(ChatActivity.EXTRA_TITLE, row.title);
                 startActivity(i);
             }
+        });
+
+        list.setOnItemLongClickListener((parent, view, position, id) -> {
+            ChatSettings.show(this, adapter.getItem(position).chatId, chatList(), this::loadChatsFromCacheThenNetwork);
+            return true;
         });
 
         empty = new TextView(this);
@@ -101,7 +116,7 @@ public class MainActivity extends android.app.Activity {
      * and LoadChats must still be issued so the list is current.
      */
     private void loadChatsFromCacheThenNetwork() {
-        Td.send(new TdApi.GetChats(new TdApi.ChatListMain(), 100),
+        Td.send(new TdApi.GetChats(chatList(), 100),
                 new Client.ResultHandler() {
                     @Override public void onResult(TdApi.Object object) {
                         if (object instanceof TdApi.Chats) {
@@ -110,7 +125,7 @@ public class MainActivity extends android.app.Activity {
                     }
                 });
 
-        Td.send(new TdApi.LoadChats(new TdApi.ChatListMain(), 100),
+        Td.send(new TdApi.LoadChats(chatList(), 100),
                 new Client.ResultHandler() {
                     @Override public void onResult(TdApi.Object object) {
                         // 404 means the chat list is already fully loaded, which
@@ -120,7 +135,7 @@ public class MainActivity extends android.app.Activity {
                             if (e.code != 404) Log.w(TAG, "LoadChats: " + e.message);
                             return;
                         }
-                        Td.send(new TdApi.GetChats(new TdApi.ChatListMain(), 100),
+                        Td.send(new TdApi.GetChats(chatList(), 100),
                                 new Client.ResultHandler() {
                                     @Override public void onResult(TdApi.Object o) {
                                         if (o instanceof TdApi.Chats) {
@@ -139,14 +154,40 @@ public class MainActivity extends android.app.Activity {
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
         menu.add(0, 1, 0, "Refresh");
-        menu.add(0, 2, 1, "Log out");
+        menu.add(0, 6, 5, R.string.about_title);
+        if (!archive) {
+            menu.add(0, 3, 1, "Join group");
+            menu.add(0, 4, 2, "Archived chats");
+            menu.add(0, 5, 3, "Privacy and security");
+            menu.add(0, 2, 4, "Log out");
+        }
         return true;
     }
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
+        if (item.getItemId() == 6) {
+            startActivity(new Intent(this, AboutActivity.class));
+            return true;
+        }
+        if (item.getItemId() == android.R.id.home && archive) {
+            finish();
+            return true;
+        }
+        if (item.getItemId() == 3) {
+            ChatSettings.joinGroup(this);
+            return true;
+        }
+        if (item.getItemId() == 4) {
+            startActivity(new Intent(this, MainActivity.class).putExtra(ARCHIVE_VIEW, true));
+            return true;
+        }
+        if (item.getItemId() == 5) {
+            PrivacySettings.show(this);
+            return true;
+        }
         if (item.getItemId() == 1) {
-            Td.send(new TdApi.GetChats(new TdApi.ChatListMain(), 100),
+            Td.send(new TdApi.GetChats(chatList(), 100),
                     new Client.ResultHandler() {
                         @Override public void onResult(TdApi.Object object) {
                             if (object instanceof TdApi.Chats) {
@@ -219,7 +260,7 @@ public class MainActivity extends android.app.Activity {
     void onChat(TdApi.Chat chat) {
 
         Td.cacheChat(chat);
-        final ChatRow row = ChatRow.from(chat);
+        final ChatRow row = ChatRow.from(chat, chatList());
         ui.post(new Runnable() {
             @Override public void run() {
                 if (destroyed) return;
@@ -244,28 +285,26 @@ public class MainActivity extends android.app.Activity {
         boolean supported;
         long order;
 
-        static ChatRow from(TdApi.Chat chat) {
+        static ChatRow from(TdApi.Chat chat, TdApi.ChatList list) {
             ChatRow r = new ChatRow();
             r.chatId = chat.id;
-            r.title = chat.title;
-            r.order = orderOf(chat);
+            r.title = Td.chatTitle(chat);
+            TdApi.ChatPosition position = ChatSettings.position(chat, list);
+            r.order = position == null ? 0 : position.order;
             r.supported = Td.scope(chat) != ChatScope.EXCLUDED;
-            r.preview = previewOf(chat.lastMessage);
+            r.preview = previewOf(chat.lastMessage, chat.type instanceof TdApi.ChatTypeSecret);
             return r;
         }
 
-        /** Order of this chat in the main list, or MAX_VALUE if not there. */
-        static long orderOf(TdApi.Chat chat) {
-            if (chat.positions == null) return 0L;
-            for (TdApi.ChatPosition p : chat.positions) {
-                if (p.list instanceof TdApi.ChatListMain) return p.order;
-            }
-            return 0L;
+        static String previewOf(TdApi.Message m) {
+            return previewOf(m, false);
         }
 
-        static String previewOf(TdApi.Message m) {
+        private static String previewOf(TdApi.Message m, boolean secretChat) {
             if (m == null || m.content == null) return "";
             TdApi.MessageContent c = m.content;
+            String event = ServiceMessage.describe(c, secretChat);
+            if (event != null) return event;
             if (c instanceof TdApi.MessageText) {
                 return ((TdApi.MessageText) c).text.text;
             }

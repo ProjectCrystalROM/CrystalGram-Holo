@@ -25,6 +25,8 @@ import java.util.Map;
 
 /** Topic list for an eligible group forum. */
 public class ForumActivity extends Activity {
+    static final String EXTRA_FORWARD_CHAT = "forwardChatId";
+    static final String EXTRA_FORWARD_MESSAGE = "forwardMessageId";
     private static final int PAGE_SIZE = 50;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final Map<Integer, TdApi.ForumTopic> topics = new HashMap<>();
@@ -86,6 +88,30 @@ public class ForumActivity extends Activity {
         list.setOnItemClickListener((parent, view, position, id) -> {
             if (!opened || Td.scope(chatId) != ChatScope.FORUM || position >= adapter.getCount()) return;
             TdApi.ForumTopic topic = adapter.getItem(position);
+            long fromChat = getIntent().getLongExtra(EXTRA_FORWARD_CHAT, 0);
+            long messageId = getIntent().getLongExtra(EXTRA_FORWARD_MESSAGE, 0);
+            if (fromChat != 0 && messageId != 0) {
+                if (Td.scope(fromChat) == ChatScope.EXCLUDED) return;
+                if (!ChatScope.canSendToTopic(topic.info, Td.supergroup(Td.chat(chatId)))) {
+                    ConversationActions.toast(this, "This topic is closed.");
+                    return;
+                }
+                ConversationActions.confirm(this, "Forward to " + topic.info.name + "?", () -> {
+                    if (!opened || Td.scope(chatId) != ChatScope.FORUM
+                            || Td.scope(fromChat) == ChatScope.EXCLUDED) return;
+                    Td.send(new TdApi.ForwardMessages(chatId,
+                            new TdApi.MessageTopicForum(topic.info.forumTopicId), fromChat,
+                            new long[] {messageId}, null, false, false), result -> ui.post(() -> {
+                        if (isFinishing()) return;
+                        if (result instanceof TdApi.Error) {
+                            ConversationActions.toast(this, ((TdApi.Error) result).message);
+                        } else if (result instanceof TdApi.Messages) {
+                            finish();
+                        }
+                    }));
+                });
+                return;
+            }
             startActivity(new Intent(this, ChatActivity.class)
                     .putExtra(ChatActivity.EXTRA_CHAT_ID, chatId)
                     .putExtra(ChatActivity.EXTRA_TOPIC_ID, topic.info.forumTopicId));
@@ -119,6 +145,7 @@ public class ForumActivity extends Activity {
             if (getActionBar() != null) getActionBar().setSubtitle(R.string.forum_topics);
             opened = true;
             Td.bindForum(this);
+            Td.setOnline(true);
             Td.send(new TdApi.OpenChat(chatId));
             loadPage(true, true);
         }));
@@ -131,6 +158,7 @@ public class ForumActivity extends Activity {
         if (opened) {
             opened = false;
             Td.unbindForum(this);
+            Td.setOnline(false);
             Td.send(new TdApi.CloseChat(chatId));
         }
         super.onPause();
@@ -234,6 +262,7 @@ public class ForumActivity extends Activity {
 
     @Override public boolean onCreateOptionsMenu(Menu menu) {
         menu.add(0, 1, 0, R.string.forum_refresh);
+        menu.add(0, 3, 2, "Chat settings");
         menu.add(0, 2, 1, R.string.forum_show_hidden).setCheckable(true).setChecked(showHidden);
         return true;
     }
@@ -245,6 +274,10 @@ public class ForumActivity extends Activity {
         }
         if (item.getItemId() == 1) {
             loadPage(true, true);
+            return true;
+        }
+        if (item.getItemId() == 3 && opened) {
+            ChatSettings.show(this, chatId, new TdApi.ChatListMain(), () -> {});
             return true;
         }
         if (item.getItemId() == 2) {

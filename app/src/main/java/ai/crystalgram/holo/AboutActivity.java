@@ -19,20 +19,11 @@ public class AboutActivity extends Activity {
         tv.setPadding(p, p, p, p);
         tv.setTextSize(14);
         tv.setText(
-            "CrystalGram Holo\n" +
-            "skeleton build\n\n" +
+            getString(R.string.app_name) + "\n" +
+            getString(R.string.release_branding, BuildConfig.VERSION_NAME) + "\n\n" +
             "Device      : " + Build.MANUFACTURER + " " + Build.MODEL + "\n" +
-            "Board       : " + Build.BOARD + "\n" +
-            "Android     : " + Build.VERSION.RELEASE
-                              + "  (API " + Build.VERSION.SDK_INT + ")\n" +
-            "ABI         : " + Build.CPU_ABI + "\n" +
-            "Build       : " + Build.DISPLAY + "\n\n" +
-            "minSdkVersion : 16\n" +
-            "UI toolkit    : framework only (Theme.Holo)\n" +
-            "Backend       : TDLib 1.8.67, not yet linked\n\n" +
-            "Chats shown in this build are fake data, used to\n" +
-            "evaluate the UI on real hardware before TDLib\n" +
-            "is wired up."
+            "Android     : " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")\n" +
+            "ABI         : " + Build.CPU_ABI
         );
 
         ScrollView sv = new ScrollView(this);

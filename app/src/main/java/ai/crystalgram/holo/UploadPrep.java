@@ -82,15 +82,20 @@ final class UploadPrep {
         if (path == null) return null;
         try {
             File file = new File(path).getCanonicalFile();
-            String external = android.os.Environment.getExternalStorageDirectory()
-                    .getCanonicalPath() + File.separator;
-            if (!file.getPath().startsWith(external) || !file.isFile()) return null;
+            if (!isReadableSharedFile(file)) return null;
             try (FileInputStream probe = new FileInputStream(file)) {
                 return file;
             }
         } catch (java.io.IOException | SecurityException e) {
             return null;
         }
+    }
+
+    static boolean isReadableSharedFile(File canonicalFile) throws java.io.IOException {
+        String external = android.os.Environment.getExternalStorageDirectory()
+                .getCanonicalPath() + File.separator;
+        return canonicalFile.getPath().startsWith(external) && canonicalFile.isFile()
+                && canonicalFile.canRead();
     }
 
     /**

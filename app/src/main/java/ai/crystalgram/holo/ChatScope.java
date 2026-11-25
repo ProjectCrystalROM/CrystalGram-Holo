@@ -6,7 +6,7 @@ import org.drinkless.tdlib.TdApi;
 enum ChatScope {
     EXCLUDED, CONVERSATION, FORUM;
 
-    static ChatScope of(TdApi.ChatType type, TdApi.Supergroup group) {
+    static ChatScope of(TdApi.ChatType type, TdApi.Supergroup group, TdApi.User peer) {
         if (type instanceof TdApi.ChatTypeSupergroup) {
             TdApi.ChatTypeSupergroup supergroup = (TdApi.ChatTypeSupergroup) type;
             if (supergroup.isChannel || group == null || group.id != supergroup.supergroupId
@@ -14,8 +14,13 @@ enum ChatScope {
                     || group.isAdministeredDirectMessagesGroup) return EXCLUDED;
             return group.isForum ? FORUM : CONVERSATION;
         }
-        if (type instanceof TdApi.ChatTypePrivate || type instanceof TdApi.ChatTypeBasicGroup
-                || type instanceof TdApi.ChatTypeSecret) return CONVERSATION;
+        if (type instanceof TdApi.ChatTypePrivate) {
+            long userId = ((TdApi.ChatTypePrivate) type).userId;
+            if (peer == null || peer.id != userId) return EXCLUDED;
+            return peer.type instanceof TdApi.UserTypeRegular || peer.type instanceof TdApi.UserTypeDeleted
+                    ? CONVERSATION : EXCLUDED;
+        }
+        if (type instanceof TdApi.ChatTypeBasicGroup || type instanceof TdApi.ChatTypeSecret) return CONVERSATION;
         return EXCLUDED;
     }
 

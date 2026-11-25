@@ -23,6 +23,7 @@ public final class Td {
     private static volatile Client client;
     private static final Handler main = new Handler(Looper.getMainLooper());
     private static Context application;
+    private static volatile AccountTerms accountTerms;
     private static NetworkMonitor network;
     private static TdApi.AuthorizationState authorizationState;
     private static String startupError;
@@ -55,6 +56,7 @@ public final class Td {
     static void ensureStarted(Context context) {
         if (client != null) return;
         application = context.getApplicationContext();
+        if (accountTerms == null) accountTerms = new AccountTerms((android.app.Application) application);
         startupError = null;
         authorizationState = null;
         System.loadLibrary("tdjni");
@@ -71,7 +73,21 @@ public final class Td {
         }
     }
 
-    static boolean authorized() {
+    static AccountTerms accountTerms() { return accountTerms; }
+
+    static boolean termsBlocked() {
+        AccountTerms gate = accountTerms;
+        return gate != null && gate.pending() != null;
+    }
+
+    static void onTermsGateChanged() {
+        NotificationService service = notifier;
+        if (service != null) service.onTermsGateChanged();
+    }
+
+    static boolean authorized() { return sessionReady() && !termsBlocked(); }
+
+    static boolean sessionReady() {
         return !loggingOut && authorizationState instanceof TdApi.AuthorizationStateReady;
     }
 
@@ -93,6 +109,8 @@ public final class Td {
 
     private static void updateAuthorization(TdApi.AuthorizationState state) {
         authorizationState = state;
+        if (state instanceof TdApi.AuthorizationStateWaitPhoneNumber
+                || state instanceof TdApi.AuthorizationStateLoggingOut) accountTerms.clear();
         if (state instanceof TdApi.AuthorizationStateWaitTdlibParameters) {
             TdApi.SetTdlibParameters params = new TdApi.SetTdlibParameters();
             params.databaseDirectory = application.getDir("tdlib", Context.MODE_PRIVATE)
@@ -136,6 +154,7 @@ public final class Td {
             client = null;
             myId = 0;
             MediaLoader.reset();
+            DocumentProvider.revokeOffers();
             connectionState = null;
             synchronized (lock) {
                 chats.clear();
@@ -174,7 +193,10 @@ public final class Td {
     }
 
     static ChatScope scope(TdApi.Chat chat) {
-        return chat == null ? ChatScope.EXCLUDED : ChatScope.of(chat.type, supergroup(chat));
+        if (chat == null) return ChatScope.EXCLUDED;
+        TdApi.User peer = chat.type instanceof TdApi.ChatTypePrivate
+                ? user(((TdApi.ChatTypePrivate) chat.type).userId) : null;
+        return ChatScope.of(chat.type, supergroup(chat), peer);
     }
 
     static ChatScope scope(long chatId) { return scope(chat(chatId)); }
@@ -222,21 +244,23 @@ public final class Td {
             for (TdApi.Chat chat : chats.values()) {
                 if (chat.type instanceof TdApi.ChatTypeSupergroup
                         && ((TdApi.ChatTypeSupergroup) chat.type).supergroupId == group.id
-                        && (rightsChanged || ChatScope.of(chat.type, before) != ChatScope.of(chat.type, group))) {
+                        && (rightsChanged || ChatScope.of(chat.type, before, null) != ChatScope.of(chat.type, group, null))) {
                     changed.add(chat);
                 }
             }
         }
-        for (TdApi.Chat chat : changed) {
-            MainActivity list = chatList;
-            if (list != null) list.onChat(chat);
-            NotificationService service = notifier;
-            if (service != null) service.onChatScopeChanged(chat.id);
-            ForumActivity topics = forum;
-            if (topics != null) topics.onScopeChanged(chat.id);
-            ChatActivity screen = conversation;
-            if (screen != null) screen.onScopeChanged(chat.id);
-        }
+        for (TdApi.Chat chat : changed) onChatScopeChanged(chat);
+    }
+
+    private static void onChatScopeChanged(TdApi.Chat chat) {
+        MainActivity list = chatList;
+        if (list != null) list.onChat(chat);
+        NotificationService service = notifier;
+        if (service != null) service.onChatScopeChanged(chat.id);
+        ForumActivity topics = forum;
+        if (topics != null) topics.onScopeChanged(chat.id);
+        ChatActivity screen = conversation;
+        if (screen != null) screen.onScopeChanged(chat.id);
     }
 
     static void bindForum(ForumActivity screen) { forum = screen; }
@@ -245,6 +269,48 @@ public final class Td {
     private static void refreshForum(long chatId) {
         ForumActivity screen = forum;
         if (screen != null) screen.onTopicsChanged(chatId);
+    }
+
+    static java.util.ArrayList<TdApi.Chat> forwardDestinations() {
+        java.util.ArrayList<TdApi.Chat> result = new java.util.ArrayList<>();
+        synchronized (lock) {
+            for (TdApi.Chat chat : chats.values()) {
+                if (scope(chat) != ChatScope.EXCLUDED && !(chat.type instanceof TdApi.ChatTypeSecret)
+                        && chat.positions != null && chat.positions.length != 0
+                        && chat.permissions != null && chat.permissions.canSendBasicMessages) result.add(chat);
+            }
+        }
+        java.util.Collections.sort(result, (a, b) -> String.valueOf(a.title).compareToIgnoreCase(String.valueOf(b.title)));
+        return result;
+    }
+
+    static String userName(TdApi.User user) {
+        if (user == null) return "";
+        if (user.type instanceof TdApi.UserTypeDeleted) return "Deleted Account";
+        String first = user.firstName == null ? "" : user.firstName;
+        String last = user.lastName == null ? "" : user.lastName;
+        return (first + " " + last).trim();
+    }
+
+    static String chatTitle(TdApi.Chat chat) {
+        TdApi.User peer = chat.type instanceof TdApi.ChatTypePrivate
+                ? user(((TdApi.ChatTypePrivate) chat.type).userId) : null;
+        if (peer != null && peer.type instanceof TdApi.UserTypeDeleted) return "Deleted Account";
+        if (chat.title != null && !chat.title.trim().isEmpty()) return chat.title;
+        String name = userName(peer);
+        return !name.isEmpty() ? name : "Unnamed chat";
+    }
+
+    static java.util.ArrayList<TdApi.Chat> privacyChats() {
+        java.util.ArrayList<TdApi.Chat> result = new java.util.ArrayList<>();
+        synchronized (lock) {
+            for (TdApi.Chat chat : chats.values()) {
+                if (scope(chat) != ChatScope.EXCLUDED && chat.positions != null && chat.positions.length > 0) {
+                    result.add(chat);
+                }
+            }
+        }
+        return result;
     }
 
     static TdApi.User user(long id) {
@@ -263,6 +329,10 @@ public final class Td {
             if (handler != null) handler.onResult(new TdApi.Error(503, "Telegram is starting"));
             return;
         }
+        if (termsBlocked() && !AccountTerms.allowsWhilePending(query)) {
+            if (handler != null) handler.onResult(new TdApi.Error(403, "Review the updated Telegram terms first."));
+            return;
+        }
         c.send(query, handler);
     }
 
@@ -274,12 +344,7 @@ public final class Td {
 
     static TdApi.ConnectionState connectionState() { return connectionState; }
 
-    /**
-     * The "online" option tells TDLib whether the user is actively present.
-     * While true, TDLib assumes the user is looking at the app and suppresses
-     * message notifications entirely, so it must be false whenever no screen
-     * is in front of the user.
-     */
+    /** Publishes foreground presence using Telegram’s account privacy settings. */
     static void setOnline(boolean online) {
         send(new TdApi.SetOption("online", new TdApi.OptionValueBoolean(online)));
     }
@@ -327,7 +392,12 @@ public final class Td {
                 }
 
             } else if (object instanceof TdApi.UpdateForumTopic) {
-                refreshForum(((TdApi.UpdateForumTopic) object).chatId);
+                TdApi.UpdateForumTopic update = (TdApi.UpdateForumTopic) object;
+                ChatActivity screen = conversation;
+                if (screen != null) {
+                    screen.onReadOutbox(update.chatId, update.forumTopicId, update.lastReadOutboxMessageId);
+                }
+                refreshForum(update.chatId);
 
             } else if (object instanceof TdApi.UpdateTopicMessageCount) {
                 TdApi.UpdateTopicMessageCount update = (TdApi.UpdateTopicMessageCount) object;
@@ -336,7 +406,8 @@ public final class Td {
             } else if (object instanceof TdApi.UpdateChatPosition) {
                 TdApi.UpdateChatPosition u = (TdApi.UpdateChatPosition) object;
                 MainActivity a = chatList;
-                if (a != null && u.position.list instanceof TdApi.ChatListMain) {
+                if (a != null && (u.position.list instanceof TdApi.ChatListMain
+                        || u.position.list instanceof TdApi.ChatListArchive)) {
                     a.onChatUpdated(u.chatId);
                 }
 
@@ -356,6 +427,23 @@ public final class Td {
                 ConnectionListener l = connectionListener;
                 if (l != null) l.onConnectionState(st);
 
+            } else if (object instanceof TdApi.UpdateMessageEdited) {
+                ChatActivity screen = conversation;
+                if (screen != null) screen.onMessageEdited((TdApi.UpdateMessageEdited) object);
+
+            } else if (object instanceof TdApi.UpdateMessageInteractionInfo) {
+                ChatActivity screen = conversation;
+                if (screen != null) screen.onInteractionInfo((TdApi.UpdateMessageInteractionInfo) object);
+
+            } else if (object instanceof TdApi.UpdateUserStatus) {
+                TdApi.UpdateUserStatus update = (TdApi.UpdateUserStatus) object;
+                synchronized (lock) {
+                    TdApi.User user = users.get(update.userId);
+                    if (user != null) user.status = update.status;
+                }
+                ChatActivity screen = conversation;
+                if (screen != null) screen.onPresence(update.userId, update.status);
+
             } else if (object instanceof TdApi.UpdateMessageContent) {
                 TdApi.UpdateMessageContent update = (TdApi.UpdateMessageContent) object;
                 ChatActivity chat = conversation;
@@ -373,7 +461,27 @@ public final class Td {
 
             } else if (object instanceof TdApi.UpdateUser) {
                 TdApi.UpdateUser u = (TdApi.UpdateUser) object;
-                synchronized (lock) { users.put(u.user.id, u.user); }
+                java.util.ArrayList<TdApi.Chat> changed = new java.util.ArrayList<>();
+                java.util.ArrayList<TdApi.Chat> renamed = new java.util.ArrayList<>();
+                synchronized (lock) {
+                    // TDLib sends UpdateUser before returning a reference to that user.
+                    TdApi.User old = users.put(u.user.id, u.user);
+                    boolean nameChanged = !userName(old).equals(userName(u.user));
+                    for (TdApi.Chat chat : chats.values()) {
+                        if (!(chat.type instanceof TdApi.ChatTypePrivate)
+                                || ((TdApi.ChatTypePrivate) chat.type).userId != u.user.id) continue;
+                        if (ChatScope.of(chat.type, null, old) != ChatScope.of(chat.type, null, u.user)) {
+                            changed.add(chat);
+                        } else if (nameChanged) {
+                            renamed.add(chat);
+                        }
+                    }
+                }
+                for (TdApi.Chat chat : changed) onChatScopeChanged(chat);
+                MainActivity list = chatList;
+                if (list != null) for (TdApi.Chat chat : renamed) list.onChat(chat);
+                ChatActivity screen = conversation;
+                if (screen != null) screen.onPresence(u.user.id, u.user.status);
 
             } else if (object instanceof TdApi.UpdateNotificationGroup) {
                 TdApi.UpdateNotificationGroup u = (TdApi.UpdateNotificationGroup) object;
@@ -389,6 +497,11 @@ public final class Td {
                 TdApi.UpdateActiveNotifications u = (TdApi.UpdateActiveNotifications) object;
                 NotificationService service = notifier;
                 if (service != null) service.onActiveNotifications(u);
+
+            } else if (object instanceof TdApi.UpdateChatReadOutbox) {
+                TdApi.UpdateChatReadOutbox update = (TdApi.UpdateChatReadOutbox) object;
+                ChatActivity screen = conversation;
+                if (screen != null) screen.onReadOutbox(update.chatId, 0, update.lastReadOutboxMessageId);
 
             } else if (object instanceof TdApi.UpdateChatReadInbox) {
                 TdApi.UpdateChatReadInbox u = (TdApi.UpdateChatReadInbox) object;
@@ -423,6 +536,10 @@ public final class Td {
                     TdApi.UpdateMessageSendFailed u = (TdApi.UpdateMessageSendFailed) object;
                     c.onMessageFailed(u.message, u.oldMessageId, u.error);
                 }
+
+            } else if (object instanceof TdApi.UpdateTermsOfService) {
+                TdApi.UpdateTermsOfService update = (TdApi.UpdateTermsOfService) object;
+                main.post(() -> accountTerms.update(update));
 
             } else if (object instanceof TdApi.UpdateAuthorizationState) {
                 final TdApi.AuthorizationState state =

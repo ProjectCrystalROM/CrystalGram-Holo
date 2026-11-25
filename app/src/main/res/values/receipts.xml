@@ -1,0 +1,8 @@
+<resources>
+    <string name="receipt_timestamp">%1$s · %2$s</string>
+    <string name="receipt_sending">Sending</string>
+    <string name="receipt_sent">Sent</string>
+    <string name="receipt_seen">Seen</string>
+    <string name="receipt_failed">Not sent</string>
+    <string name="receipt_scheduled">Scheduled</string>
+</resources>

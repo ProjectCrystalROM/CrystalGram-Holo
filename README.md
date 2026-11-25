@@ -1,10 +1,14 @@
 # CrystalGram Holo
 
-An unofficial Telegram client for Android 4.1–4.3 (Jelly Bean, API 16–18), built
-on Android's own Holo widgets with CrystalGram's own chat bubbles.
+**1.0 · Prismatic Echo**
+
+**CrystalGram Holo is an unofficial client that uses the Telegram API and is
+part of the Telegram ecosystem.** It runs on Android 4.1–4.3 (Jelly Bean,
+API 16–18) and uses Android's native Holo widgets.
 
 CrystalGram Holo is not affiliated with, endorsed by, or produced by Telegram.
-It uses the public Telegram API under its own application credentials.
+Official CrystalGram Holo builds use the project's own Telegram API credentials
+and are distributed through [GitHub Releases](https://github.com/ProjectCrystalROM/CrystalGram-Holo/releases).
 
 ## Status
 
@@ -16,15 +20,21 @@ CyanogenMod 10.2 — Android 4.3.1, API 18, armeabi-v7a.
 | Dark Holo chrome (platform widgets, no AndroidX/Material) | working |
 | CrystalGram bubbles: rounded corners, tail, per-bubble timestamps | working |
 | TDLib backend, native bridge on armv7 | working |
-| Authentication: phone, code, optional password | working |
+| Existing-account sign-in: phone, code, optional password | supported |
 | Chat list for private chats and groups, Telegram's own ordering | working |
 | Text messaging, send dedupe on server ack | working |
 | Message history, paging backwards on scroll | working |
 | Supergroup forums | topic list, scoped history, messaging, reads and notifications |
-| Read receipts and typing indicators (API ToS §1.4) | working |
-| Channels | **out of scope — see below** |
+| Presence | online and last-seen in private chats, typing in both directions |
+| Outgoing receipts | Sending, Sent and Seen, including per-topic read state |
+| Message actions | long-press to edit text, forward, reply, delete or react with standard emoji |
+| Chat management | join supported groups, leave, mute, pin and archive |
+| Privacy and security | block users, edit common privacy policies and manage active sessions |
+| Cloud expiration | per-chat auto-delete and timed or view-once photos and videos |
+| Bots and polls | slash commands, inline callback buttons, poll results and voting |
+| Broadcast channels and private bot chats | **out of scope — see below** |
 | Photo and sticker previews, video thumbnails, file attachments | supported |
-| Full playback, document opening and voice playback | out of scope |
+| Ordinary attachments | in-app photo, video and audio viewer, documents open through a chosen Android app |
 | Background notifications | TDLib connection, no Google Play Services |
 
 The TDLib 1.8.71 upgrade was installed over the previous signed release on
@@ -53,7 +63,7 @@ single `Path` so there is no seam between body and tail:
 Forum-enabled supergroups open a Holo topic list. For API behavior, topic
 routing and the channel exclusion checks, see [Forum topics](docs/forum-topics.md).
 
-## Why channels are not supported
+## Broadcast channels and private bot chats
 
 Telegram's API Terms of Service §3.3 requires that a client which shows channels
 renders Telegram's official sponsored messages in them. That obligation cannot
@@ -66,6 +76,10 @@ channel, or substituted with other content.
 
 Broadcast channels are permanently outside the application scope. Forum topic
 support applies only to eligible supergroups.
+
+Private bot chats are also excluded from conversation lists, notifications,
+navigation, and forwarding destinations. Bot interaction inside supported
+groups and voting in polls remain available.
 
 ## Building
 
@@ -90,9 +104,14 @@ separate password. An in-place install requires the existing app's signer.
 
 ## Licence
 
-Application source: to be decided.
+CrystalGram Holo's own code is licensed under the [GNU General Public License,
+version 3](LICENSE) (GPL-3.0-only). Third-party components retain their own
+licences. See [NATIVE.md](NATIVE.md#licensing) for TDLib and OpenSSL.
 
-The bundled native library in `app/src/main/jniLibs/armeabi-v7a/` is TDLib,
-built from upstream source by this project and unrelated to this application's
-own code; see [NATIVE.md](NATIVE.md) for how it is built, why the commit is
-pinned, and the terms that apply to it.
+Each GitHub Release with an APK should make its corresponding source available
+from the same release page at no extra charge. Include the GPLv3 text, the
+exact app source, and the scripts, source, and patches needed to rebuild the
+bundled native library. The automatic GitHub source archive covers the tagged
+repository. If the archive lacks any required native sources, attach a separate
+corresponding-source archive or link directly to the matching source from the
+release notes.
