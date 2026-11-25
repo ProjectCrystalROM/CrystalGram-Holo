@@ -1,97 +1,51 @@
 #!/usr/bin/env bash
-#
-# Build libtdjni.so from TDLib source, the way upstream intends: two stages.
-#
-# Stage 1 configures TDLib natively with TD_GENERATE_SOURCE_FILES=ON. That pass
-# is not a real build - it exists only to run the generators, which cannot
-# execute during a cross-compile. Doing it this way produces every generated
-# artifact at once (tl-derived headers, MIME tables, Java API) instead of
-# hand-generating them one at a time and discovering the next missing file
-# partway through stage 2.
-#
-# Stage 2 cross-compiles tdjni against those generated sources.
-#
-# See NATIVE.md for why the commit must not change: JNI_OnLoad hashes the
-# generated TdApi and aborts the process on a mismatch, so a different revision
-# than the app's TdApi.java is not a build error - it is an uncatchable crash.
-#
-# Usage:
-#   ./scripts/build-tdlib-android.sh
-#
-# Environment (defaults shown):
-#   TD_SRC=$HOME/crystalgram/tdlib-src
-#   NDK=$ANDROID_SDK_ROOT/ndk/23.2.8568313
-#   OPENSSL=$HOME/crystalgram/toolchain/openssl/android-16/armeabi-v7a
-#   OUT=$HOME/crystalgram/out/tdlib-android
-#   CMAKE=cmake          (set to a 3.x path if your system cmake is 4.x)
-#
 set -euo pipefail
 
-TD=${TD_SRC:-$HOME/crystalgram/tdlib-src}
-OUT=${OUT:-$HOME/crystalgram/out/tdlib-android}
-NDK=${NDK:-${ANDROID_SDK_ROOT:-$HOME/crystalgram/toolchain/sdk}/ndk/23.2.8568313}
-OPENSSL=${OPENSSL:-$HOME/crystalgram/toolchain/openssl/android-16/armeabi-v7a}
-CMAKE=${CMAKE:-cmake}
-NATIVE=$OUT/build-native
-CROSS=$OUT/build
-WANT=42e6a5259551178d1dab54a22ad96d14bd906e20
-JOBS=${JOBS:-$(nproc)}
+if [[ $# != 3 ]]; then
+    echo "Usage: $0 <TDLib checkout> <OpenSSL API 16 install prefix> <output directory>" >&2
+    exit 2
+fi
 
-cd "$TD"
-GOT=$(git rev-parse HEAD)
-[ "$GOT" = "$WANT" ] || {
-  echo "FAIL: TDLib is at $GOT, expected $WANT" >&2
-  echo "      TdApi.java in the app was generated at $WANT; a different" >&2
-  echo "      revision will fail JNI_OnLoad at startup." >&2
-  exit 1
-}
-echo "commit OK: $WANT"
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source_dir=$(realpath "$1")
+openssl=$(realpath "$2")
+output_dir=$(realpath -m "$3")
+cmake="${CG_CMAKE:-cmake}"
+ndk="${ANDROID_NDK_ROOT:-${ANDROID_HOME:-$root/toolchain/sdk}/ndk/23.2.8568313}"
+jobs="${CG_JOBS:-4}"
+revision=$(git -C "$source_dir" rev-parse HEAD)
+example="$source_dir/example/android"
+host="$output_dir/host"
+arm="$output_dir/arm"
+patch="$root/scripts/patches/tdlib-android-system-certs.patch"
 
-[ -f "$OPENSSL/lib/libssl.a" ] || { echo "FAIL: no static OpenSSL at $OPENSSL" >&2; exit 1; }
-[ -f "$NDK/build/cmake/android.toolchain.cmake" ] || { echo "FAIL: no NDK at $NDK" >&2; exit 1; }
+if git -C "$source_dir" apply --check "$patch" 2>/dev/null; then
+    git -C "$source_dir" apply "$patch"
+elif ! git -C "$source_dir" apply --reverse --check "$patch"; then
+    echo "Android certificate patch does not apply to $revision" >&2
+    exit 1
+fi
 
-# --- stage 1: generate sources natively --------------------------------
-echo
-echo "=== stage 1: generating TDLib sources (native) ==="
-mkdir -p "$NATIVE"
-cd "$NATIVE"
-# TD_ENABLE_JNI must be set here too. Without it generate_common emits
-# td_api.h without get_package_name_ref / get_git_commit_hash /
-# Function::fetch, and td_jni.cpp fails to compile in stage 2 with seven
-# "no member named" errors.
-"$CMAKE" "$TD" \
-  -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DTD_GENERATE_SOURCE_FILES=ON \
-  -DTD_ENABLE_JNI=ON
-"$CMAKE" --build . -- -j"$JOBS"
+# A Git worktree requires an explicit revision because older CMake Git
+# helpers can discover the primary checkout's HEAD.
+"$cmake" -S "$example" -B "$host" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DTD_GIT_COMMIT_HASH="$revision" -DTD_GENERATE_SOURCE_FILES=ON \
+    -DPHP_EXECUTABLE=OFF
+"$cmake" --build "$host" --target tl_generate_tlo -j "$jobs"
+"$cmake" --build "$host" --target tl_generate_java tl_generate_common tl_generate_mtproto -j "$jobs"
+"$cmake" -S "$example" -B "$host" -DTD_GENERATE_SOURCE_FILES=OFF
+"$cmake" --build "$host" --target tdmime_auto -j "$jobs"
 
-[ -f "$TD/td/generate/auto/td/telegram/e2e_api.h" ] || {
-  echo "FAIL: stage 1 did not generate e2e_api.h" >&2; exit 1; }
+"$cmake" -S "$example" -B "$arm" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DTD_GIT_COMMIT_HASH="$revision" \
+    -DCMAKE_TOOLCHAIN_FILE="$ndk/build/cmake/android.toolchain.cmake" \
+    -DANDROID_PLATFORM=android-16 -DANDROID_ABI=armeabi-v7a \
+    -DANDROID_ARM_NEON=FALSE -DANDROID_STL=c++_static \
+    -U 'OPENSSL_*' -U '_OPENSSL_*' \
+    -DOPENSSL_ROOT_DIR="$openssl" -DOPENSSL_USE_STATIC_LIBS=TRUE
+"$cmake" --build "$arm" --target tdjni -j "$jobs"
 
-# --- stage 2: cross-compile --------------------------------------------
-echo
-echo "=== stage 2: cross-compiling tdjni for armeabi-v7a / android-16 ==="
-mkdir -p "$CROSS"
-cd "$CROSS"
-"$CMAKE" "$TD/example/android" \
-  -G Ninja \
-  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
-  -DANDROID_ABI=armeabi-v7a \
-  -DANDROID_PLATFORM=android-16 \
-  -DANDROID_STL=c++_static \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DOPENSSL_ROOT_DIR="$OPENSSL" \
-  -DOPENSSL_INCLUDE_DIR="$OPENSSL/include" \
-  -DOPENSSL_CRYPTO_LIBRARY="$OPENSSL/lib/libcrypto.a" \
-  -DOPENSSL_SSL_LIBRARY="$OPENSSL/lib/libssl.a" \
-  -DOPENSSL_USE_STATIC_LIBS=TRUE
-"$CMAKE" --build . --target tdjni -- -j"$JOBS"
-
-echo
-echo "=== result ==="
-find "$CROSS" -name 'libtdjni.so' -exec ls -lh {} \;
-echo
-echo "Verify the static link took (NEEDED should list only liblog, libdl,"
-echo "libz, libm, libc):"
-echo "  llvm-readelf -d $CROSS/libtdjni.so | grep NEEDED"
+stubs="$ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/16"
+python3 "$root/scripts/check-api16-native.py" "$arm/libtdjni.so" "$stubs"
+cp "$arm/libtdjni.so" "$example/org/drinkless/tdlib/TdApi.java" \
+    "$source_dir/example/java/org/drinkless/tdlib/Client.java" "$output_dir/"

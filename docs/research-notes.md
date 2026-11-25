@@ -1,5 +1,10 @@
 # CrystalGram Holo — TDLib on Android 4.1 (API 16) with wolfSSL
 
+> Historical wolfSSL research. The released app uses TDLib 1.8.71 with
+> OpenSSL 3.5.9 and the API 16 ARMv7 sysroot. See [NATIVE.md](../NATIVE.md)
+> and the [compatibility audit](../COMPATIBILITY-AUDIT.md) for the current build.
+
+
 Research and build log for a Windows-native Telegram client for Android 4.1–4.3.
 Updated as work proceeds.
 

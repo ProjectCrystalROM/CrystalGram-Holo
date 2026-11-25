@@ -1,113 +1,50 @@
 # Bundled native library
 
-`app/src/main/jniLibs/armeabi-v7a/libtdjni.so` is built by this project from
-TDLib source. It is the only `.so` the app ships: OpenSSL and the C++ runtime
-are linked into it statically, so there is no `libsslx.so`, `libcryptox.so` or
-`libc++_shared.so` to keep in step.
+The APK ships one ARMv7 shared library at
+`app/src/main/jniLibs/armeabi-v7a/libtdjni.so`. It contains TDLib 1.8.71
+(layer 234) at `1b9efe84d6e9a2e2f6eadeeea32b0726d2b8c25d`, static OpenSSL
+3.5.9, SQLite, and the static C++ runtime.
 
-| File | Size | Built from |
-|---|---|---|
-| `libtdjni.so` | ~17 MB | TDLib `42e6a5259551178d1dab54a22ad96d14bd906e20` |
+## Rebuild
 
-## The commit must not change
+Use JDK 17, a host C/C++ compiler with C++17 support, CMake 3.x, Ninja, gperf,
+Perl, Make, Python 3, GNU readelf, and Android NDK r23c (23.2.8568313).
+Set `ANDROID_NDK_ROOT` to the installed NDK and `CG_CMAKE` if CMake is outside
+your PATH. The NDK's 32-bit API 16 sysroot is required for the target.
 
-TDLib's `JNI_OnLoad` compares a hash baked into the generated `TdApi.java`
-against one baked into the native library and **aborts the process** on a
-mismatch. There is no exception to catch and nothing in logcat beyond the
-library loading.
+Use clean source checkouts at the TDLib commit above and OpenSSL tag
+`openssl-3.5.9` (`45e844fa2a14ec92d146bd8f5778ac130b6625fb`).
 
-`TdApi.java` in this repository was generated from the source tree at exactly
-`42e6a5259551178d1dab54a22ad96d14bd906e20`. Regenerating it at a different
-commit means rebuilding the library in the same pass — never one without the
-other.
-
-## How it is built
-
-Two stages. This is upstream's method (`example/android/build-tdlib.sh`), and
-the two-stage split is not optional: TDLib's CMake skips every source-generation
-rule when cross-compiling, because the generators are host executables it cannot
-run for the target. Skipping stage 1 means the cross build fails partway through
-looking for a generated file that nothing will produce.
-
-**Stage 1 — generate sources natively.**
-
-```sh
-mkdir build-native && cd build-native
-cmake .. -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DTD_GENERATE_SOURCE_FILES=ON \
-  -DTD_ENABLE_JNI=ON
-cmake --build . -j"$(nproc)"
+```bash
+scripts/build-openssl-android.sh /path/to/openssl .research/openssl-api16
+scripts/build-tdlib-android.sh /path/to/td .research/openssl-api16 .research/tdlib-api16
 ```
 
-`-DTD_ENABLE_JNI=ON` is the flag that is easy to miss and expensive to debug
-without: `td/generate/CMakeLists.txt` only defines `TD_ENABLE_JNI=1` for the
-`generate_common` target when it is set, so without it `td_api.h` is emitted
-without `get_package_name_ref`, `get_git_commit_hash` or `Function::fetch` —
-and `td_jni.cpp` then fails to compile with seven errors about missing members.
-The header is regenerated and looks plausible; only those symbols are absent.
+The TDLib script applies the Android certificate-store patch to its source
+checkout, generates C++ and Java sources on the host, then cross-builds and
+checks the library. To update the app, copy `TdApi.java` from the output into
+`app/src/main/java/org/drinkless/tdlib/` and `libtdjni.so` into
+`app/src/main/jniLibs/armeabi-v7a/` as a pair. Verify `Client.java` against the
+upstream copy in the output. JNI registers methods during `JNI_OnLoad` and
+checks the matching generated API revision during startup.
 
-**Stage 2 — cross-compile the target.**
+## Compatibility
 
-```sh
-mkdir build && cd build
-cmake ../../tdlib-src/example/android -G Ninja \
-  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
-  -DANDROID_ABI=armeabi-v7a \
-  -DANDROID_PLATFORM=android-16 \
-  -DANDROID_STL=c++_static \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DOPENSSL_ROOT_DIR="$OPENSSL" \
-  -DOPENSSL_USE_STATIC_LIBS=TRUE
-cmake --build . --target tdjni -j"$(nproc)"
-```
+The native target is ARMv7, VFPv3-D16 with no binary-wide NEON requirement.
+`scripts/check-api16-native.py` checks the bundled binary against the NDK API
+16 stubs and validates its ELF traits. The five dynamic dependencies are
+`liblog.so`, `libdl.so`, `libz.so`, `libm.so` and `libc.so`. The library
+retains SysV hashing and conventional ARM relocations for Jelly Bean's linker.
 
-`android-16` matches `minSdkVersion`. TDLib's default is newer, and building
-against it produces calls that will not resolve on Jelly Bean. `c++_static`
-avoids shipping a second shared library.
+OpenSSL uses Android's system CA store through the patch in
+`scripts/patches/tdlib-android-system-certs.patch`. Jelly Bean uses
+`/system/etc/security/cacerts`. Newer Android releases can use the Conscrypt
+APEX store. Peer verification remains enabled.
 
-`scripts/build-tdlib-android.sh` runs both stages and refuses to start if the
-source tree is not at the expected commit.
-
-## Toolchain used
-
-| Component | Version |
-|---|---|
-| NDK | 23.2.8568313 |
-| CMake | 3.31.6 (upstream pins 3.22.1; the SDK here ships neither) |
-| OpenSSL | 1.1.1w, `no-asm`, static, `android-16/armeabi-v7a` |
-| Generator | Ninja 1.13.2 |
-
-Upstream's `build-openssl.sh` builds OpenSSL 1.1.1 by default for the same
-reason this project does: much smaller binary and better performance on this
-hardware than 3.x. `no-asm` is required — the ARM assembly paths do not build
-under NDK 23 for this target.
-
-## Why it is committed
-
-17 MB of build output in git is real weight. It is committed so that a clone
-builds and runs without first reproducing a native toolchain, and because the
-alternative — a binary host that can be lost — is worse.
-
-To verify a committed library matches its stated source:
-
-```sh
-llvm-nm -D --defined-only libtdjni.so | grep JNI_OnLoad
-llvm-readelf -d libtdjni.so | grep NEEDED
-```
-
-`NEEDED` should list only `liblog`, `libdl`, `libz`, `libm` and `libc`. A
-`libsslx.so`, `libcryptox.so` or `libc++_shared.so` there means the static
-link did not take.
-
-There are no `Java_org_drinkless_tdlib_*` symbols in either a correct or an
-incorrect build: `td_jni.cpp` registers its native methods dynamically in
-`JNI_OnLoad` via `RegisterNatives`. `JNI_OnLoad` being present is the whole
-check at the symbol level; whether the version hash agrees can only be proven
-on a device.
+The [compatibility audit](COMPATIBILITY-AUDIT.md) records the ELF checks and
+the API 18 in-place upgrade result.
 
 ## Licensing
 
-Upstream TDLib is Apache-2.0. OpenSSL 1.1.1 is under the OpenSSL/SSLeay licence.
-No application code from Telegram X or the official Telegram client is included
-or was ever compiled in.
+TDLib is licensed under the Boost Software License 1.0. The OpenSSL 3.5.9
+Apache 2.0 license is included in `app/src/main/assets/licenses/OpenSSL.txt`.

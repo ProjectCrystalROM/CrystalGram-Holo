@@ -22,7 +22,14 @@ CyanogenMod 10.2 — Android 4.3.1, API 18, armeabi-v7a.
 | Message history, paging backwards on scroll | working |
 | Read receipts and typing indicators (API ToS §1.4) | working |
 | Channels | **out of scope — see below** |
-| Media, stickers, voice messages | text placeholder only |
+| Photo and sticker previews, video thumbnails, file attachments | supported |
+| Full playback, document opening and voice playback | out of scope |
+| Background notifications | TDLib connection, no Google Play Services |
+
+The TDLib 1.8.71 upgrade was installed over the previous signed release on
+the API 18 device. The existing session resumed and queued notifications
+arrived after the upgrade. API 16 was checked statically. See the
+[compatibility audit](COMPATIBILITY-AUDIT.md) for details.
 
 ## Design rules
 
@@ -60,17 +67,24 @@ third-party clients.
 
 ## Building
 
-See [BUILDING.md](BUILDING.md). In short: you need an `api_id` and `api_hash`
-from https://my.telegram.org/apps in `local.properties`, plus the Android SDK
-and NDK described there.
+Use JDK 17, Gradle 7.6.3, Android SDK Platform 34 and Build Tools 34.0.0.
+Create `app/local.properties` with your SDK path and Telegram application
+credentials from [Telegram](https://my.telegram.org/apps).
 
-`local.properties` is git-ignored and must never be committed:
-
-```
+```properties
 sdk.dir=/path/to/android-sdk
 api_id=12345
-api_hash=0123456789abcdef0123456789abcdef
+api_hash=your_telegram_api_hash
 ```
+
+Run `gradle -p app assembleDebug lintDebug`. The APK is written to
+`app/app/build/outputs/apk/debug/`. The repository includes the native
+library. See [NATIVE.md](NATIVE.md) for native rebuild instructions.
+
+For a signed release update, set `keystore.path`, `keystore.password`, and
+`keystore.alias` in the same ignored file, then run
+`gradle -p app assembleRelease`. Set `keystore.keyPassword` if the key has a
+separate password. An in-place install requires the existing app's signer.
 
 ## Licence
 

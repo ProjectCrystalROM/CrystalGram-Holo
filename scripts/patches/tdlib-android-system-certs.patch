@@ -1,0 +1,46 @@
+diff --git a/tdnet/td/net/SslCtx.cpp b/tdnet/td/net/SslCtx.cpp
+index 3af7103a6..0768d4847 100644
+--- a/tdnet/td/net/SslCtx.cpp
++++ b/tdnet/td/net/SslCtx.cpp
+@@ -124,8 +124,7 @@ X509_STORE *load_system_certificate_store() {
+     }
+   };
+ 
+-  string default_cert_dir = X509_get_default_cert_dir();
+-  for (auto cert_dir : full_split(default_cert_dir, ':')) {
++  auto add_dir = [&](CSlice cert_dir) {
+     walk_path(cert_dir, [&](CSlice path, WalkPath::Type type) {
+       if (type != WalkPath::Type::RegularFile && type != WalkPath::Type::Symlink) {
+         return type == WalkPath::Type::EnterDir && path != cert_dir ? WalkPath::Action::SkipDir
+@@ -134,12 +133,30 @@ X509_STORE *load_system_certificate_store() {
+       add_file(path);
+       return WalkPath::Action::Continue;
+     }).ignore();
++  };
++#if defined(__ANDROID__)
++  // An NDK cross-build's OpenSSL defaults refer to its install prefix.
++  // Android ships hashed PEM roots in its own system certificate directories.
++  auto apex = realpath("/apex/com.android.conscrypt/cacerts");
++  if (apex.is_ok()) {
++    add_dir(apex.ok());
++  } else {
++    add_dir("/system/etc/security/cacerts");
++  }
++  if (file_count == 0) {
++    X509_STORE_free(store);
++    return nullptr;
++  }
++#else
++  string default_cert_dir = X509_get_default_cert_dir();
++  for (auto cert_dir : full_split(default_cert_dir, ':')) {
++    add_dir(cert_dir);
+   }
+-
+   string default_cert_path = X509_get_default_cert_file();
+   if (!default_cert_path.empty()) {
+     add_file(default_cert_path);
+   }
++#endif
+ 
+ #if OPENSSL_VERSION_NUMBER >= 0x10100000L
+   auto objects = X509_STORE_get0_objects(store);
