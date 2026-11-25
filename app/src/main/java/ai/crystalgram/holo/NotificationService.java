@@ -63,10 +63,27 @@ public class NotificationService extends Service {
         else context.startService(intent);
     }
 
-    /** Chat ids the user is currently looking at; these must never notify. */
-    private static volatile long openChatId;
+    private static final class OpenConversation {
+        final long chatId;
+        final int topicId;
 
-    static void setOpenChat(long chatId) { openChatId = chatId; }
+        OpenConversation(long chatId, int topicId) {
+            this.chatId = chatId;
+            this.topicId = topicId;
+        }
+    }
+
+    private static volatile OpenConversation open = new OpenConversation(0, 0);
+
+    static void setOpenChat(long chatId, int topicId) {
+        OpenConversation before = open;
+        open = new OpenConversation(chatId, topicId);
+        NotificationService service = instance;
+        if (service != null) {
+            if (before.chatId != 0) service.onChatScopeChanged(before.chatId);
+            if (chatId != 0 && chatId != before.chatId) service.onChatScopeChanged(chatId);
+        }
+    }
 
     @Override
     public void onCreate() {
@@ -194,11 +211,11 @@ public class NotificationService extends Service {
         }
     }
 
-    void onChatRead(long chatId, long lastReadInboxMessageId) {
+    void onChatScopeChanged(long chatId) {
         synchronized (groups) {
-            if (destroyed || chatId != openChatId) return;
+            if (destroyed) return;
             for (TdApi.NotificationGroup group : groups.values()) {
-                if (group.chatId == chatId) nm.cancel(MESSAGE_TAG, group.id);
+                if (group.chatId == chatId) render(group, false);
             }
         }
     }
@@ -212,21 +229,30 @@ public class NotificationService extends Service {
      * a summary line updating.
      */
     private void render(TdApi.NotificationGroup g, boolean alert) {
-        // Never notify for the chat on screen: it is already in front of them.
-        if (g.chatId != 0 && g.chatId == openChatId) {
-            note("render: skipped, chat " + g.chatId + " is open");
+        TdApi.Chat chat = Td.chat(g.chatId);
+        ChatScope scope = Td.scope(chat);
+        if (scope == ChatScope.EXCLUDED) {
             nm.cancel(MESSAGE_TAG, g.id);
             return;
         }
 
-        TdApi.Notification latest = latestIn(g);
+        OpenConversation shown = open;
+        TdApi.Notification latest = null;
+        int visible = 0;
+        boolean matchingChat = shown.chatId == g.chatId;
+        for (TdApi.Notification candidate : g.notifications) {
+            int topicId = notificationTopic(g.chatId, candidate);
+            if (scope.suppressesNotification(matchingChat, shown.topicId, topicId)) continue;
+            visible++;
+            if (latest == null || candidate.id > latest.id) latest = candidate;
+        }
         if (latest == null) {
             note("render: no notification to show, cancelling");
             nm.cancel(MESSAGE_TAG, g.id);
             return;
         }
 
-        int count = g.totalCount > 0 ? g.totalCount : 1;
+        int count = matchingChat ? visible : Math.max(visible, g.totalCount);
 
         String title = titleFor(g);
         String text = textFor(latest);
@@ -247,7 +273,7 @@ public class NotificationService extends Service {
         b.setOnlyAlertOnce(!alert || latest.isSilent);
         if (!latest.isSilent) b.setDefaults(Notification.DEFAULT_ALL);
 
-        b.setContentIntent(openIntent(g));
+        b.setContentIntent(openIntent(g, scope, latest));
         // Without a deleteIntent the service never learns the user cleared it,
         // and TDLib keeps believing the group is on screen.
         b.setDeleteIntent(dismissIntent(g.id, latest.id));
@@ -257,12 +283,12 @@ public class NotificationService extends Service {
         note("render: notified id=" + g.id);
     }
 
-    private TdApi.Notification latestIn(TdApi.NotificationGroup group) {
-        TdApi.Notification best = null;
-        for (TdApi.Notification candidate : group.notifications) {
-            if (best == null || candidate.id > best.id) best = candidate;
+    private static int notificationTopic(long chatId, TdApi.Notification notification) {
+        if (notification.type instanceof TdApi.NotificationTypeNewMessage) {
+            TdApi.Message message = ((TdApi.NotificationTypeNewMessage) notification.type).message;
+            if (message != null && message.chatId == chatId) return ChatScope.forumTopic(message.topicId);
         }
-        return best;
+        return 0;
     }
 
     private String titleFor(TdApi.NotificationGroup g) {
@@ -337,17 +363,15 @@ public class NotificationService extends Service {
                 intentFlags());
     }
 
-    private PendingIntent openIntent(TdApi.NotificationGroup g) {
+    private PendingIntent openIntent(TdApi.NotificationGroup g, ChatScope scope,
+                                     TdApi.Notification latest) {
         Intent i = new Intent().setClassName(this, LoginActivity.NOTIFICATION_ENTRY);
-        TdApi.Chat c = Td.chat(g.chatId);
-        if (c == null || !MainActivity.ChatRow.isSupported(c.type)) {
-            return PendingIntent.getActivity(this, g.id, i, intentFlags());
-        }
         i.putExtra(ChatActivity.EXTRA_CHAT_ID, g.chatId);
-        if (c != null) i.putExtra(ChatActivity.EXTRA_TITLE, c.title);
+        if (scope == ChatScope.FORUM) {
+            i.putExtra(ChatActivity.EXTRA_TOPIC_ID, notificationTopic(g.chatId, latest));
+        }
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        return PendingIntent.getActivity(
-                this, g.id, i, intentFlags());
+        return PendingIntent.getActivity(this, g.id, i, intentFlags());
     }
 
     /** The notification that says the service is running. */

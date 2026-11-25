@@ -29,6 +29,8 @@ public final class Td {
     private static boolean loggingOut;
     private static final Object lock = new Object();
     private static volatile long myId;
+    private static final java.util.Map<Long, TdApi.Supergroup> groups = new java.util.HashMap<>();
+    private static volatile ForumActivity forum;
     private static final java.util.HashMap<Long, TdApi.Chat> chats =
             new java.util.HashMap<Long, TdApi.Chat>();
     private static final java.util.HashMap<Long, TdApi.User> users =
@@ -138,6 +140,7 @@ public final class Td {
             synchronized (lock) {
                 chats.clear();
                 users.clear();
+                groups.clear();
             }
             if (login != null) {
                 login.onAuthorizationState(state);
@@ -162,6 +165,86 @@ public final class Td {
 
     static void cacheChat(TdApi.Chat chat) {
         synchronized (lock) { chats.put(chat.id, chat); }
+    }
+
+    static TdApi.Supergroup supergroup(TdApi.Chat chat) {
+        if (chat == null || !(chat.type instanceof TdApi.ChatTypeSupergroup)) return null;
+        long id = ((TdApi.ChatTypeSupergroup) chat.type).supergroupId;
+        synchronized (lock) { return groups.get(id); }
+    }
+
+    static ChatScope scope(TdApi.Chat chat) {
+        return chat == null ? ChatScope.EXCLUDED : ChatScope.of(chat.type, supergroup(chat));
+    }
+
+    static ChatScope scope(long chatId) { return scope(chat(chatId)); }
+
+    interface ChatHandler {
+        void onChat(TdApi.Chat chat);
+    }
+
+    /** Resolves eligibility from TDLib's offline chat and supergroup objects. */
+    static void resolveChat(long chatId, final ChatHandler handler) {
+        send(new TdApi.GetChat(chatId), new Client.ResultHandler() {
+            @Override public void onResult(TdApi.Object result) {
+                if (!(result instanceof TdApi.Chat)) {
+                    handler.onChat(null);
+                    return;
+                }
+                final TdApi.Chat chat = (TdApi.Chat) result;
+                cacheChat(chat);
+                if (!(chat.type instanceof TdApi.ChatTypeSupergroup)
+                        || ((TdApi.ChatTypeSupergroup) chat.type).isChannel) {
+                    handler.onChat(chat);
+                    return;
+                }
+                long id = ((TdApi.ChatTypeSupergroup) chat.type).supergroupId;
+                send(new TdApi.GetSupergroup(id), new Client.ResultHandler() {
+                    @Override public void onResult(TdApi.Object result) {
+                        if (result instanceof TdApi.Supergroup) {
+                            rememberGroup((TdApi.Supergroup) result);
+                            handler.onChat(chat);
+                        } else {
+                            handler.onChat(null);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    private static void rememberGroup(TdApi.Supergroup group) {
+        java.util.List<TdApi.Chat> changed = new java.util.ArrayList<>();
+        synchronized (lock) {
+            TdApi.Supergroup before = groups.put(group.id, group);
+            boolean rightsChanged = before != null
+                    && ChatScope.canManageTopics(before.status) != ChatScope.canManageTopics(group.status);
+            for (TdApi.Chat chat : chats.values()) {
+                if (chat.type instanceof TdApi.ChatTypeSupergroup
+                        && ((TdApi.ChatTypeSupergroup) chat.type).supergroupId == group.id
+                        && (rightsChanged || ChatScope.of(chat.type, before) != ChatScope.of(chat.type, group))) {
+                    changed.add(chat);
+                }
+            }
+        }
+        for (TdApi.Chat chat : changed) {
+            MainActivity list = chatList;
+            if (list != null) list.onChat(chat);
+            NotificationService service = notifier;
+            if (service != null) service.onChatScopeChanged(chat.id);
+            ForumActivity topics = forum;
+            if (topics != null) topics.onScopeChanged(chat.id);
+            ChatActivity screen = conversation;
+            if (screen != null) screen.onScopeChanged(chat.id);
+        }
+    }
+
+    static void bindForum(ForumActivity screen) { forum = screen; }
+    static void unbindForum(ForumActivity screen) { if (forum == screen) forum = null; }
+
+    private static void refreshForum(long chatId) {
+        ForumActivity screen = forum;
+        if (screen != null) screen.onTopicsChanged(chatId);
     }
 
     static TdApi.User user(long id) {
@@ -226,9 +309,29 @@ public final class Td {
         public void onResult(TdApi.Object object) {
             if (object instanceof TdApi.UpdateNewChat) {
                 TdApi.Chat nc = ((TdApi.UpdateNewChat) object).chat;
-                synchronized (lock) { chats.put(nc.id, nc); }
+                cacheChat(nc);
+                NotificationService service = notifier;
+                if (service != null) service.onChatScopeChanged(nc.id);
                 MainActivity a = chatList;
                 if (a != null) a.onChat(((TdApi.UpdateNewChat) object).chat);
+
+            } else if (object instanceof TdApi.UpdateSupergroup) {
+                rememberGroup(((TdApi.UpdateSupergroup) object).supergroup);
+
+            } else if (object instanceof TdApi.UpdateForumTopicInfo) {
+                TdApi.ForumTopicInfo info = ((TdApi.UpdateForumTopicInfo) object).info;
+                if (info != null) {
+                    refreshForum(info.chatId);
+                    ChatActivity screen = conversation;
+                    if (screen != null) screen.onTopicInfo(info);
+                }
+
+            } else if (object instanceof TdApi.UpdateForumTopic) {
+                refreshForum(((TdApi.UpdateForumTopic) object).chatId);
+
+            } else if (object instanceof TdApi.UpdateTopicMessageCount) {
+                TdApi.UpdateTopicMessageCount update = (TdApi.UpdateTopicMessageCount) object;
+                if (ChatScope.forumTopic(update.topicId) > 0) refreshForum(update.chatId);
 
             } else if (object instanceof TdApi.UpdateChatPosition) {
                 TdApi.UpdateChatPosition u = (TdApi.UpdateChatPosition) object;
@@ -243,7 +346,9 @@ public final class Td {
 
             } else if (object instanceof TdApi.UpdateChatLastMessage) {
                 MainActivity a = chatList;
-                if (a != null) a.onChatUpdated(((TdApi.UpdateChatLastMessage) object).chatId);
+                long id = ((TdApi.UpdateChatLastMessage) object).chatId;
+                if (a != null) a.onChatUpdated(id);
+                refreshForum(id);
 
             } else if (object instanceof TdApi.UpdateConnectionState) {
                 TdApi.ConnectionState st = ((TdApi.UpdateConnectionState) object).state;
@@ -259,7 +364,12 @@ public final class Td {
             } else if (object instanceof TdApi.UpdateDeleteMessages) {
                 TdApi.UpdateDeleteMessages update = (TdApi.UpdateDeleteMessages) object;
                 ChatActivity chat = conversation;
-                if (chat != null && !update.fromCache) chat.onMessagesDeleted(update);
+                if (!update.fromCache) {
+                    if (chat != null) chat.onMessagesDeleted(update);
+                    ForumActivity screen = forum;
+                    if (screen != null) screen.onMessagesDeleted(update);
+                    refreshForum(update.chatId);
+                }
 
             } else if (object instanceof TdApi.UpdateUser) {
                 TdApi.UpdateUser u = (TdApi.UpdateUser) object;
@@ -282,19 +392,19 @@ public final class Td {
 
             } else if (object instanceof TdApi.UpdateChatReadInbox) {
                 TdApi.UpdateChatReadInbox u = (TdApi.UpdateChatReadInbox) object;
-                NotificationService service = notifier;
-                if (service != null) service.onChatRead(u.chatId, u.lastReadInboxMessageId);
                 MainActivity a = chatList;
                 if (a != null) a.onChatUpdated(u.chatId);
 
             } else if (object instanceof TdApi.UpdateChatAction) {
                 TdApi.UpdateChatAction u = (TdApi.UpdateChatAction) object;
                 ChatActivity c = conversation;
-                if (c != null) c.onChatAction(u.chatId, u.senderId, u.action);
+                if (c != null) c.onChatAction(u.chatId, u.topicId, u.senderId, u.action);
 
             } else if (object instanceof TdApi.UpdateNewMessage) {
                 ChatActivity c = conversation;
-                if (c != null) c.onNewMessage(((TdApi.UpdateNewMessage) object).message);
+                TdApi.Message message = ((TdApi.UpdateNewMessage) object).message;
+                if (c != null) c.onNewMessage(message);
+                if (ChatScope.forumTopic(message.topicId) > 0) refreshForum(message.chatId);
 
             } else if (object instanceof TdApi.UpdateMessageSendSucceeded) {
                 TdApi.UpdateMessageSendSucceeded ok = (TdApi.UpdateMessageSendSucceeded) object;

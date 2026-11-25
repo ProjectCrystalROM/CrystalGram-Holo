@@ -20,6 +20,7 @@ CyanogenMod 10.2 — Android 4.3.1, API 18, armeabi-v7a.
 | Chat list for private chats and groups, Telegram's own ordering | working |
 | Text messaging, send dedupe on server ack | working |
 | Message history, paging backwards on scroll | working |
+| Supergroup forums | topic list, scoped history, messaging, reads and notifications |
 | Read receipts and typing indicators (API ToS §1.4) | working |
 | Channels | **out of scope — see below** |
 | Photo and sticker previews, video thumbnails, file attachments | supported |
@@ -49,6 +50,9 @@ single `Path` so there is no seam between body and tail:
 | Bubble text | `#1A1A1A` |
 | Timestamp | `#5A5A5A`, 75% size, on its own line, aligned to the bubble's outer edge |
 
+Forum-enabled supergroups open a Holo topic list. For API behavior, topic
+routing and the channel exclusion checks, see [Forum topics](docs/forum-topics.md).
+
 ## Why channels are not supported
 
 Telegram's API Terms of Service §3.3 requires that a client which shows channels
@@ -60,10 +64,8 @@ not content filtering: there is no channel view for sponsors to be removed
 from, and no sponsored message is ever relocated, restyled, hidden inside a
 channel, or substituted with other content.
 
-The alternative — implementing sponsors faithfully, including ones we would
-rather not carry — is the only other compliant path. That decision is pending
-word from Telegram support about whether channel support is optional for
-third-party clients.
+Broadcast channels are permanently outside the application scope. Forum topic
+support applies only to eligible supergroups.
 
 ## Building
 

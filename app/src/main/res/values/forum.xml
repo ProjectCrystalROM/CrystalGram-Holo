@@ -1,0 +1,17 @@
+<resources>
+    <string name="forum_topics">Topics</string>
+    <string name="forum_loading">Loading topics…</string>
+    <string name="forum_empty">No topics.</string>
+    <string name="forum_more">Load more topics</string>
+    <string name="forum_refresh">Refresh</string>
+    <string name="forum_pinned">Pinned</string>
+    <string name="forum_closed">Closed</string>
+    <string name="forum_hidden">Hidden</string>
+    <string name="forum_show_hidden">Show hidden General topic</string>
+    <string name="forum_unavailable">This conversation is unavailable.</string>
+    <string name="forum_topic_closed">This topic is closed.</string>
+    <plurals name="forum_unread">
+        <item quantity="one">%d unread message</item>
+        <item quantity="other">%d unread messages</item>
+    </plurals>
+</resources>

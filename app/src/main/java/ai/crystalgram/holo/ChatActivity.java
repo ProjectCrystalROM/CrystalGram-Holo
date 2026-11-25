@@ -57,6 +57,11 @@ public class ChatActivity extends Activity {
     private TextView typingLabel;
     private EditText input;
     private long chatId;
+    static final String EXTRA_TOPIC_ID = "forumTopicId";
+    private int topicId;
+    private TdApi.ForumTopicInfo topicInfo;
+    private Button sendButton;
+    private String chatTitle;
     private float density;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private MessageAdapter adapter;
@@ -82,11 +87,11 @@ public class ChatActivity extends Activity {
         density = getResources().getDisplayMetrics().density;
 
         chatId = getIntent().getLongExtra(EXTRA_CHAT_ID, 0L);
-        String title = getIntent().getStringExtra(EXTRA_TITLE);
+        topicId = getIntent().getIntExtra(EXTRA_TOPIC_ID, 0);
 
         android.app.ActionBar bar = getActionBar();
         if (bar != null) {
-            bar.setTitle(title == null ? "Chat" : title);
+            bar.setTitle(R.string.app_name);
             bar.setDisplayHomeAsUpEnabled(true);
         }
 
@@ -149,6 +154,7 @@ public class ChatActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         Button send = new Button(this);
+        sendButton = send;
         send.setText("Send");
         send.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { sendMessage(); }
@@ -160,6 +166,7 @@ public class ChatActivity extends Activity {
         input.clearFocus();
         list.requestFocus();
 
+        setComposerEnabled(false);
         setContentView(root);
 
     }
@@ -172,25 +179,111 @@ public class ChatActivity extends Activity {
             finish();
             return;
         }
+        final int request = historyGeneration;
+        Td.resolveChat(chatId, chat -> ui.post(() -> {
+            if (isFinishing() || request != historyGeneration) return;
+            ChatScope scope = chat == null ? ChatScope.EXCLUDED : Td.scope(chatId);
+            if (scope == ChatScope.FORUM && topicId == 0) {
+                startActivity(new Intent(this, ForumActivity.class).putExtra(EXTRA_CHAT_ID, chatId));
+                finish();
+                return;
+            }
+            if (!scope.allowsHistory(topicId)) {
+                unavailable();
+                return;
+            }
+            chatTitle = chat.title;
+            if (topicId == 0) {
+                setTitle(chatTitle);
+                openHistory();
+                return;
+            }
+            Td.send(new TdApi.GetForumTopic(chatId, topicId), result -> ui.post(() -> {
+                if (isFinishing() || request != historyGeneration) return;
+                if (!(result instanceof TdApi.ForumTopic) || Td.scope(chatId) != ChatScope.FORUM) {
+                    unavailable();
+                    return;
+                }
+                TdApi.ForumTopicInfo info = ((TdApi.ForumTopic) result).info;
+                if (info == null || info.chatId != chatId || info.forumTopicId != topicId) {
+                    unavailable();
+                    return;
+                }
+                applyTopicInfo(info);
+                openHistory();
+            }));
+        }));
+    }
+
+    private void unavailable() {
+        Toast.makeText(this, R.string.forum_unavailable, Toast.LENGTH_SHORT).show();
+        finish();
+    }
+
+    private void openHistory() {
         resumed = true;
+        setComposerEnabled(maySend());
         Td.bindConversation(this);
-        Td.setOnline(true);
+        // The notification service can show unread messages in other forum topics.
+        Td.setOnline(topicId == 0);
         Td.send(new TdApi.OpenChat(chatId));
-        NotificationService.setOpenChat(chatId);
+        NotificationService.setOpenChat(chatId, topicId);
         MediaLoader.get().addListener(mediaListener);
         startNetworkWatch();
         loadHistory(0);
     }
 
+    private void setComposerEnabled(boolean enabled) {
+        input.setEnabled(enabled);
+        sendButton.setEnabled(enabled);
+        invalidateOptionsMenu();
+    }
+
+    private void applyTopicInfo(TdApi.ForumTopicInfo info) {
+        topicInfo = info;
+        if (!maySend()) clearTyping();
+        setTitle(info.name);
+        if (getActionBar() != null) getActionBar().setSubtitle(chatTitle);
+        if (!maySend()) input.setHint(R.string.forum_topic_closed);
+        else input.setHint("Message");
+        setComposerEnabled(resumed && maySend());
+    }
+
+    void onTopicInfo(TdApi.ForumTopicInfo info) {
+        if (info.chatId != chatId || info.forumTopicId != topicId) return;
+        ui.post(() -> {
+            if (!isFinishing() && Td.scope(chatId) == ChatScope.FORUM) applyTopicInfo(info);
+        });
+    }
+
+    void onScopeChanged(long id) {
+        if (id == chatId) ui.post(() -> {
+            if (!resumed) return;
+            if (!Td.scope(chatId).allowsHistory(topicId)) unavailable();
+            else if (topicInfo != null) applyTopicInfo(topicInfo);
+        });
+    }
+
+    private TdApi.MessageTopic topic() {
+        return topicId == 0 ? null : new TdApi.MessageTopicForum(topicId);
+    }
+
+    private boolean maySend() {
+        TdApi.Chat chat = Td.chat(chatId);
+        return Td.authorized() && Td.scope(chat).allowsHistory(topicId)
+                && (topicId == 0 || ChatScope.canSendToTopic(topicInfo, Td.supergroup(chat)));
+    }
+
     @Override
     protected void onPause() {
+        historyGeneration++;
         if (resumed) {
             resumed = false;
-            historyGeneration++;
+            setComposerEnabled(false);
             historyLoading = false;
             Td.setConnectionListener(null);
             MediaLoader.get().removeListener(mediaListener);
-            NotificationService.setOpenChat(0);
+            NotificationService.setOpenChat(0, 0);
             clearTyping();
             hideTyping();
             Td.send(new TdApi.CloseChat(chatId));
@@ -215,15 +308,19 @@ public class ChatActivity extends Activity {
     }
 
     private void loadHistory(final long from) {
-        if (!resumed || historyLoading) return;
+        if (!resumed || historyLoading || !Td.scope(chatId).allowsHistory(topicId)) return;
         historyLoading = true;
         final int generation = historyGeneration;
-        Td.send(new TdApi.GetChatHistory(chatId, from, 0, 50, false),
+        TdApi.Function<TdApi.Messages> query = topicId == 0
+                ? new TdApi.GetChatHistory(chatId, from, 0, 50, false)
+                : new TdApi.GetForumTopicHistory(chatId, topicId, from, 0, 50);
+        Td.send(query,
                 new Client.ResultHandler() {
                     @Override public void onResult(final TdApi.Object result) {
                         ui.post(new Runnable() {
                             @Override public void run() {
-                                if (generation != historyGeneration || !resumed) return;
+                                if (generation != historyGeneration || !resumed
+                                        || !Td.scope(chatId).allowsHistory(topicId)) return;
                                 if (result instanceof TdApi.Messages) {
                                     TdApi.Message[] messages = ((TdApi.Messages) result).messages;
                                     View anchor = list.getChildAt(0);
@@ -253,25 +350,26 @@ public class ChatActivity extends Activity {
 
     @Override
     public boolean onCreateOptionsMenu(android.view.Menu menu) {
-        menu.add(0, 3, 0, "Attach");
+        if (resumed && maySend()) menu.add(0, 3, 0, "Attach");
         return true;
     }
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
-        if (item.getItemId() == 3) { pickFile(); return true; }
+        if (item.getItemId() == 3 && resumed && maySend()) { pickFile(); return true; }
         if (item.getItemId() == android.R.id.home) { finish(); return true; }
         return super.onOptionsItemSelected(item);
     }
 
     private void sendMessage() {
+        if (!resumed || !maySend()) return;
         String text = input.getText().toString();
         if (sendingText || text.trim().length() == 0) return;
         sendingText = true;
         TdApi.InputMessageText content = new TdApi.InputMessageText();
         content.text = new TdApi.FormattedText(text, null);
         final String draft = text;
-        Td.send(new TdApi.SendMessage(chatId, null, null,
+        Td.send(new TdApi.SendMessage(chatId, topic(), null,
                 new TdApi.MessageSendOptions(), null, content), new Client.ResultHandler() {
             @Override public void onResult(final TdApi.Object result) {
                 ui.post(new Runnable() {
@@ -294,8 +392,9 @@ public class ChatActivity extends Activity {
     // -------------------------------------------------------- TDLib -> UI hooks
 
     /** UpdateChatAction: someone else started or stopped typing. */
-    void onChatAction(long id, final TdApi.MessageSender sender, final TdApi.ChatAction action) {
-        if (id != chatId) return;
+    void onChatAction(long id, TdApi.MessageTopic sourceTopic,
+                      final TdApi.MessageSender sender, final TdApi.ChatAction action) {
+        if (id != chatId || ChatScope.forumTopic(sourceTopic) != topicId) return;
         if (sender instanceof TdApi.MessageSenderUser
                 && ((TdApi.MessageSenderUser) sender).userId == Td.me()) return;
         ui.post(new Runnable() {
@@ -342,9 +441,10 @@ public class ChatActivity extends Activity {
     }
 
     void onNewMessage(final TdApi.Message message) {
-        if (message.chatId != chatId) return;
+        if (!ChatScope.matches(chatId, topicId, message)) return;
         ui.post(new Runnable() {
             @Override public void run() {
+                if (!Td.scope(chatId).allowsHistory(topicId)) return;
                 boolean atBottom = adapter.getCount() == 0
                         || list.getLastVisiblePosition() == adapter.getCount() - 1;
                 adapter.upsert(message);
@@ -354,17 +454,20 @@ public class ChatActivity extends Activity {
     }
 
     void onMessageSent(final TdApi.Message message, final long oldMessageId) {
-        if (message.chatId != chatId) return;
+        if (!ChatScope.matches(chatId, topicId, message)) return;
         ui.post(new Runnable() {
-            @Override public void run() { adapter.replaceById(oldMessageId, message); }
+            @Override public void run() {
+                if (Td.scope(chatId).allowsHistory(topicId)) adapter.replaceById(oldMessageId, message);
+            }
         });
     }
 
     void onMessageFailed(final TdApi.Message message, final long oldMessageId,
                          final TdApi.Error error) {
-        if (message.chatId != chatId) return;
+        if (!ChatScope.matches(chatId, topicId, message)) return;
         ui.post(new Runnable() {
             @Override public void run() {
+                if (!Td.scope(chatId).allowsHistory(topicId)) return;
                 adapter.replaceById(oldMessageId, message);
                 adapter.markFailed(message.id, error == null ? "not sent" : error.message);
             }
@@ -391,7 +494,15 @@ public class ChatActivity extends Activity {
         ui.post(new Runnable() {
             @Override public void run() {
                 if (update.isPermanent) {
-                    for (long id : update.messageIds) adapter.deleted.add(id);
+                    for (long id : update.messageIds) {
+                        if (ChatScope.isDeletedTopicRoot(topicInfo, id)) {
+                            topicInfo = null;
+                            setComposerEnabled(false);
+                            unavailable();
+                            return;
+                        }
+                        adapter.deleted.add(id);
+                    }
                 }
                 Set<Long> removed = new HashSet<>();
                 for (long id : update.messageIds) removed.add(id);
@@ -413,7 +524,7 @@ public class ChatActivity extends Activity {
      * clears it as soon as the draft empties.
      */
     private void onDraftChanged(boolean hasText) {
-        if (!resumed) return;
+        if (!resumed || !maySend()) return;
         long now = android.os.SystemClock.elapsedRealtime();
         if (hasText) {
             if (!typingSent || now - lastTypingSent >= TYPING_INTERVAL_MS) {
@@ -429,7 +540,9 @@ public class ChatActivity extends Activity {
     }
 
     private void sendChatAction(TdApi.ChatAction action) {
-        Td.send(new TdApi.SendChatAction(chatId, null, null, action));
+        if (Td.scope(chatId).allowsHistory(topicId)) {
+            Td.send(new TdApi.SendChatAction(chatId, topic(), null, action));
+        }
     }
 
     private void clearTyping() {
@@ -458,12 +571,21 @@ public class ChatActivity extends Activity {
         Log.i(TAG, "ViewMessages: " + ids.size() + " ids");
         long[] arr = new long[ids.size()];
         for (int i = 0; i < arr.length; i++) arr[i] = ids.get(i);
-        Td.send(new TdApi.ViewMessages(chatId, arr, null, false));
+        TdApi.MessageSource source = topicId == 0 ? null : new TdApi.MessageSourceForumTopicHistory();
+        Td.send(new TdApi.ViewMessages(chatId, arr, source, false), result -> {
+            if (result instanceof TdApi.Error) {
+                long newest = arr[arr.length - 1];
+                ui.post(() -> {
+                    if (lastViewedIncomingId == newest) lastViewedIncomingId = 0;
+                });
+            }
+        });
     }
 
     private long lastViewedIncomingId;
 
     private void markVisibleAsRead() {
+        if (!Td.scope(chatId).allowsHistory(topicId)) return;
         if (adapter.getCount() == 0) return;
         if (list.getLastVisiblePosition() < list.getFirstVisiblePosition()) return;
         int first = Math.max(0, list.getFirstVisiblePosition());
@@ -495,7 +617,8 @@ public class ChatActivity extends Activity {
             for (TdApi.Message message : items) known.add(message.id);
             int before = items.size();
             for (TdApi.Message message : page) {
-                if (message != null && !deleted.contains(message.id) && known.add(message.id)) items.add(message);
+                if (ChatScope.matches(chatId, topicId, message)
+                        && !deleted.contains(message.id) && known.add(message.id)) items.add(message);
             }
             if (items.size() != before) publish();
             return items.size() - before;
@@ -883,6 +1006,11 @@ public class ChatActivity extends Activity {
     private void sendFile(File f, UploadPrep.Kind kind, int[] dim) {
         // Only a file we copied is ours to delete; a Gallery file is the user's.
         final File tracked = UploadPrep.isStaged(this, f) ? f : null;
+        if (!maySend()) {
+            UploadCleanup.discard(tracked);
+            if (!isFinishing()) Toast.makeText(this, R.string.forum_unavailable, Toast.LENGTH_SHORT).show();
+            return;
+        }
         TdApi.InputFileLocal file = new TdApi.InputFileLocal(f.getPath());
         TdApi.InputMessageContent content;
 
@@ -916,7 +1044,7 @@ public class ChatActivity extends Activity {
             content = m;
         }
 
-        Td.send(new TdApi.SendMessage(chatId, null, null,
+        Td.send(new TdApi.SendMessage(chatId, topic(), null,
                 new TdApi.MessageSendOptions(), null, content),
                 new Client.ResultHandler() {
                     @Override public void onResult(TdApi.Object o) {

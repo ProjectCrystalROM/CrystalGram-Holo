@@ -249,7 +249,7 @@ public class MainActivity extends android.app.Activity {
             r.chatId = chat.id;
             r.title = chat.title;
             r.order = orderOf(chat);
-            r.supported = isSupported(chat.type);
+            r.supported = Td.scope(chat) != ChatScope.EXCLUDED;
             r.preview = previewOf(chat.lastMessage);
             return r;
         }
@@ -261,30 +261,6 @@ public class MainActivity extends android.app.Activity {
                 if (p.list instanceof TdApi.ChatListMain) return p.order;
             }
             return 0L;
-        }
-
-        /**
-         * Scope: private chats and groups only. Channels are hidden entirely.
-         *
-         * Telegram API ToS 3.3 requires a client that shows channels to render
-         * official sponsored messages, and that obligation cannot be met by
-         * omission. So instead of showing a channel with its sponsors stripped
-         * out, channels are not offered at all: nothing is shown, so there is
-         * nothing to strip. Sponsors are never relocated, restyled, hidden
-         * inside a channel, or replaced with other content.
-         */
-        static boolean isSupported(TdApi.ChatType type) {
-            boolean ok = type instanceof TdApi.ChatTypePrivate
-                || type instanceof TdApi.ChatTypeSecret
-                || type instanceof TdApi.ChatTypeBasicGroup
-                || (type instanceof TdApi.ChatTypeSupergroup
-                    && !((TdApi.ChatTypeSupergroup) type).isChannel);
-            String kind = type == null ? "null" : type.getClass().getSimpleName();
-            if (type instanceof TdApi.ChatTypeSupergroup) {
-                kind += (((TdApi.ChatTypeSupergroup) type).isChannel ? "(channel)" : "(group)");
-            }
-            Log.i(TAG, "type " + kind + " supported=" + ok);
-            return ok;
         }
 
         static String previewOf(TdApi.Message m) {
