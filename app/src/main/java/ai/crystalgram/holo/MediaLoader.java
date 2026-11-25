@@ -10,11 +10,13 @@ import org.drinkless.tdlib.TdApi;
 
 import java.io.File;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Downloads and decodes media for the open conversation.
@@ -37,10 +39,6 @@ final class MediaLoader {
 
     private static final String TAG = "CG-Media";
 
-    /** Bumped when the photo should switch from thumbnail to full size. */
-    static final int WANT_THUMB = 0;
-    static final int WANT_FULL = 1;
-
     interface Listener {
         void onMediaUpdated(long chatId, int fileId);
     }
@@ -52,6 +50,13 @@ final class MediaLoader {
         return instance;
     }
 
+    static synchronized void reset() {
+        if (instance != null) {
+            instance.decoder.shutdownNow();
+            instance = null;
+        }
+    }
+
     /** file id -> decoded bitmap. ~8 MB, enough for a screenful of bubbles. */
     private final LruCache<Integer, Bitmap> bitmaps =
             new LruCache<Integer, Bitmap>(8 * 1024 * 1024) {
@@ -60,11 +65,11 @@ final class MediaLoader {
                 }
             };
 
-    /** file id -> what we last asked of TDLib, so we don't re-ask. */
-    private final Map<Integer, Integer> wantLevel = new HashMap<Integer, Integer>();
-
-    /** file ids whose decode failed, so we stop retrying a broken file. */
-    private final Set<Integer> broken = new HashSet<Integer>();
+    private final Set<Integer> downloading = new HashSet<>();
+    private final Set<Integer> decoding = new HashSet<>();
+    private final LruCache<Integer, String> broken = new LruCache<>(128);
+    private final ThreadPoolExecutor decoder = new ThreadPoolExecutor(
+            1, 1, 0, TimeUnit.SECONDS, new ArrayBlockingQueue<Runnable>(16));
 
     private final List<Listener> listeners = new ArrayList<Listener>();
 
@@ -86,51 +91,22 @@ final class MediaLoader {
         return bitmaps.get(fileId);
     }
 
-    // ------------------------------------------------------------ requests
-
-    /**
-     * Asks TDLib for the file if it isn't already local.
-     *
-     * priority 1 is used for what is on screen; TDLib orders the download queue
-     * by priority, so a user scrolling back should not wait behind a queued
-     * thumbnail from a message they scrolled past.
-     */
-    void need(int fileId, int level, int priority) {
-        Integer had = wantLevel.get(fileId);
-        if (had != null && had >= level && (bitmaps.get(fileId) != null
-                || broken.contains(fileId))) {
-            return;
+    void need(final TdApi.File file) {
+        if (file == null || file.local == null || bitmap(file.id) != null) return;
+        if (file.local.isDownloadingCompleted && decode(file)) return;
+        if (!file.local.canBeDownloaded) return;
+        synchronized (downloading) {
+            if (!downloading.add(file.id)) return;
         }
-        wantLevel.put(fileId, level);
-
-        Td.send(new TdApi.DownloadFile(fileId, priority, 0, 0, false),
-                new Client.ResultHandler() {
-                    @Override public void onResult(TdApi.Object object) {
-                        if (object instanceof TdApi.Error) {
-                            Log.w(TAG, "DownloadFile failed: "
-                                    + ((TdApi.Error) object).message);
-                        }
-                    }
-                });
-    }
-
-    /** Called for every UpdateFile from TDLib. */
-    void onFileUpdated(TdApi.File file) {
-        if (file == null || file.local == null) return;
-
-        // TDLib reports many intermediate states; only act on the ones that
-        // change what can be drawn.
-        if (file.local.isDownloadingActive) {
-            notifyListeners(file.id);
-            return;
-        }
-        if (file.local.path != null && file.local.path.length() > 0) {
-            notifyListeners(file.id);
-            return;
-        }
-        if (file.local.isDownloadingCompleted && file.local.path != null) {
-            notifyListeners(file.id);
-        }
+        Td.send(new TdApi.DownloadFile(file.id, 1, 0, 0, true), new Client.ResultHandler() {
+            @Override public void onResult(TdApi.Object result) {
+                if (result instanceof TdApi.File) decode((TdApi.File) result);
+                synchronized (downloading) { downloading.remove(file.id); }
+                if (result instanceof TdApi.Error) {
+                    Log.w(TAG, "DownloadFile: " + ((TdApi.Error) result).message);
+                }
+            }
+        });
     }
 
     private void notifyListeners(int fileId) {
@@ -147,55 +123,49 @@ final class MediaLoader {
         }
     }
 
-    // -------------------------------------------------------------- decode
+    private boolean decode(final TdApi.File file) {
+        if (file.local == null || !file.local.isDownloadingCompleted) return false;
+        final String path = file.local.path;
+        if (path == null || path.length() == 0) return false;
+        final int id = file.id;
+        if (path.equals(broken.get(id)) || bitmap(id) != null) return true;
 
-    /**
-     * Decodes a file to a bitmap at a bounded size, on a background thread.
-     * Returns null if the file is not local yet.
-     */
-    Bitmap decodeAsync(final TdApi.File file, final int maxPx) {
-        if (file == null) return null;
-        final int key = file.id;
-        Bitmap cached = bitmaps.get(key);
-        if (cached != null) return cached;
-        if (broken.contains(key)) return null;
-
-        String path = file.local == null ? null : file.local.path;
-        if (path == null || path.length() == 0) return null;
-        if (!new File(path).exists()) return null;
-
-        // Decode bounds first, then a scaled decode: a full-resolution phone
-        // photo is many megabytes and would OOM on a Jelly Bean heap.
-        final String p = path;
-        new Thread(new Runnable() {
-            @Override public void run() {
-                try {
-                    BitmapFactory.Options bounds = new BitmapFactory.Options();
-                    bounds.inJustDecodeBounds = true;
-                    BitmapFactory.decodeFile(p, bounds);
-                    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-                        broken.add(key);
-                        return;
+        synchronized (decoding) {
+            if (!decoding.add(id)) return true;
+        }
+        try {
+            decoder.execute(new Runnable() {
+                @Override public void run() {
+                    try {
+                        if (!new File(path).isFile()) return;
+                        BitmapFactory.Options options = new BitmapFactory.Options();
+                        options.inJustDecodeBounds = true;
+                        BitmapFactory.decodeFile(path, options);
+                        int longest = Math.max(options.outWidth, options.outHeight);
+                        if (options.outWidth <= 0 || options.outHeight <= 0) {
+                            broken.put(id, path);
+                            return;
+                        }
+                        int sample = 1;
+                        while (longest / sample > 640) sample *= 2;
+                        options.inJustDecodeBounds = false;
+                        options.inSampleSize = sample;
+                        Bitmap bitmap = BitmapFactory.decodeFile(path, options);
+                        if (bitmap == null) broken.put(id, path);
+                        else {
+                            bitmaps.put(id, bitmap);
+                            notifyListeners(id);
+                        }
+                    } catch (RuntimeException | OutOfMemoryError e) {
+                        Log.w(TAG, "Preview decode failed", e);
+                    } finally {
+                        synchronized (decoding) { decoding.remove(id); }
                     }
-                    int sample = 1;
-                    while (bounds.outWidth / (sample * 2) >= maxPx) sample *= 2;
-
-                    BitmapFactory.Options opts = new BitmapFactory.Options();
-                    opts.inSampleSize = sample;
-                    opts.inPreferredConfig = Bitmap.Config.RGB_565; // half the memory
-                    Bitmap bmp = BitmapFactory.decodeFile(p, opts);
-                    if (bmp == null) {
-                        broken.add(key);
-                        return;
-                    }
-                    bitmaps.put(key, bmp);
-                    notifyListeners(key);
-                } catch (Throwable t) {
-                    broken.add(key);
-                    Log.w(TAG, "decode failed for " + p, t);
                 }
-            }
-        }, "media-decode").start();
-        return null;
+            });
+        } catch (RejectedExecutionException e) {
+            synchronized (decoding) { decoding.remove(id); }
+        }
+        return true;
     }
 }

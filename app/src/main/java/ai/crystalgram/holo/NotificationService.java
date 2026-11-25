@@ -7,13 +7,15 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.os.IBinder;
+import android.os.Build;
+import android.annotation.TargetApi;
+import android.app.NotificationChannel;
 import android.util.Log;
 
-import org.drinkless.tdlib.Client;
 import org.drinkless.tdlib.TdApi;
 
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -39,17 +41,27 @@ public class NotificationService extends Service {
     private static final String TAG = "CG-Notify";
 
     private static final int FOREGROUND_ID = 1;
-    private static final String CHANNEL_LIKE_ID = "service";
+    private static final String FOREGROUND_CHANNEL = "service";
+    private static final String MESSAGE_CHANNEL = "messages";
+    private static final String SILENT_CHANNEL = "silent_messages";
+    private static final String MESSAGE_TAG = "telegram";
+    private static int intentFlags() {
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= 23) flags |= PendingIntent.FLAG_IMMUTABLE;
+        return flags;
+    }
 
     private NotificationManager nm;
 
-    /** TDLib notification group id -> the Notification currently shown for it. */
-    private final Map<Integer, TdApi.NotificationGroup> groups =
-            new HashMap<Integer, TdApi.NotificationGroup>();
+    private final Map<Integer, TdApi.NotificationGroup> groups = new HashMap<>();
+    private boolean enabled;
+    private boolean destroyed;
 
-    /** Cached TdApi.Notification objects, keyed by their id. */
-    private final Map<Integer, TdApi.Notification> pending =
-            new HashMap<Integer, TdApi.Notification>();
+    static void start(Context context) {
+        Intent intent = new Intent(context, NotificationService.class);
+        if (Build.VERSION.SDK_INT >= 26) Api26.start(context, intent);
+        else context.startService(intent);
+    }
 
     /** Chat ids the user is currently looking at; these must never notify. */
     private static volatile long openChatId;
@@ -61,138 +73,55 @@ public class NotificationService extends Service {
         super.onCreate();
         instance = this;
         nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (Build.VERSION.SDK_INT >= 26) Api26.createChannels(nm);
         Td.setNotifier(this);
-        enableNotificationApi();
         startForeground(FOREGROUND_ID, buildOngoing());
         Log.i(TAG, "notification service started");
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        // START_STICKY: if the system kills us, come back. This is the whole
-        // reason messages keep arriving on a phone with no push transport.
-        return START_STICKY;
-    }
-
-    /**
-     * The user cleared a notification.
-     *
-     * TDLib will not re-post a group it believes is still on screen, so a
-     * dismissal that is never reported means that chat goes silent until the
-     * app is restarted. Both calls are issued: removeNotification for the
-     * individual notification, removeNotificationGroup for the whole group,
-     * because which one TDLib expects depends on how it built the group.
-     */
-    /** Lets the receiver reach the live service without binding to it. */
-    static void onDismissedStatic(int groupId) {
-        NotificationService s = instance;
-        if (s != null) s.onDismissed(groupId);
-    }
-
-    void onDismissed(int groupId) {
-        note("dismissed group=" + groupId);
-        synchronized (groups) {
-            TdApi.NotificationGroup g = groups.remove(groupId);
-            if (g != null && g.notifications != null) {
-                for (TdApi.Notification n : g.notifications) pending.remove(n.id);
-            }
-            // Drop pending notifications that belong to this group's chat.
-            // TdApi.Notification carries no chatId of its own, so it is read
-            // from the notification type.
-            long chatId = g == null ? 0 : g.chatId;
-            java.util.Iterator<java.util.Map.Entry<Integer, TdApi.Notification>> it =
-                    pending.entrySet().iterator();
-            while (it.hasNext()) {
-                java.util.Map.Entry<Integer, TdApi.Notification> e = it.next();
-                if (chatIdOf(e.getValue()) == chatId) it.remove();
-            }
+        try {
+            Td.ensureStarted(this);
+            if (Td.authorized()) onAuthorized();
+            return START_STICKY;
+        } catch (LinkageError | RuntimeException e) {
+            Log.e(TAG, "TDLib service startup failed", e);
+            stopSelf();
+            return START_NOT_STICKY;
         }
-        Td.send(new TdApi.RemoveNotificationGroup(groupId, 0));
     }
 
-    /**
-     * The chat a notification belongs to, or 0.
-     *
-     * TdApi.Notification has no chatId field; it lives on the notification type.
-     */
-    private static long chatIdOf(TdApi.Notification n) {
-        if (n == null || n.type == null) return 0;
-        if (n.type instanceof TdApi.NotificationTypeNewMessage) {
-            TdApi.Message m = ((TdApi.NotificationTypeNewMessage) n.type).message;
-            return m == null ? 0 : m.chatId;
-        }
-        // NewPushMessage carries no chatId; the group's own chatId covers it,
-        // so this branch contributes nothing to the match.
-        if (n.type instanceof TdApi.NotificationTypeNewPushMessage) return 0;
-        if (n.type instanceof TdApi.NotificationTypeNewSecretChat) return 0;
-        if (n.type instanceof TdApi.NotificationTypeNewCall) return 0;
-        return 0;
+    void onAuthorized() {
+        if (enabled) return;
+        enabled = true;
+        Td.send(new TdApi.SetOption("notification_group_size_max", new TdApi.OptionValueInteger(5)));
+        Td.send(new TdApi.SetOption("notification_group_count_max", new TdApi.OptionValueInteger(25)));
+    }
+
+    static void onDismissedStatic(int groupId, int maxId) {
+        NotificationService service = instance;
+        if (service == null || maxId <= 0) return;
+        Td.send(new TdApi.RemoveNotificationGroup(groupId, maxId));
     }
 
     @Override
     public void onDestroy() {
         Td.setNotifier(null);
+        instance = null;
+        synchronized (groups) {
+            destroyed = true;
+            for (int id : groups.keySet()) nm.cancel(MESSAGE_TAG, id);
+            groups.clear();
+        }
+        stopForeground(true);
         super.onDestroy();
     }
 
     @Override
     public IBinder onBind(Intent intent) { return null; }
 
-    /**
-     * The TDLib Notification API is disabled by default: option
-     * notification_group_count_max defaults to 0, which means TDLib sends no
-     * notification updates at all. Setting it positive is the entire switch.
-     *
-     * 25 is the documented maximum. The per-group size limit defaults to 10,
-     * which is fine here.
-     */
-    private void enableNotificationApi() {
-        Td.send(new TdApi.SetOption("notification_group_count_max",
-                new TdApi.OptionValueInteger(25)));
-        Td.send(new TdApi.SetOption("notification_group_size_max",
-                new TdApi.OptionValueInteger(5)));
-        // Read them back: a SetOption that silently failed would look exactly
-        // like the notification API being off, which is what was reported.
-        Td.send(new TdApi.GetOption("notification_group_count_max"),
-                new Client.ResultHandler() {
-                    @Override public void onResult(TdApi.Object o) {
-                        Log.i(TAG, "OPTION count_max = " + describe(o));
-                        note("count_max=" + describe(o));
-                    }
-                });
-        Td.send(new TdApi.GetOption("notification_group_size_max"),
-                new Client.ResultHandler() {
-                    @Override public void onResult(TdApi.Object o) {
-                        Log.i(TAG, "OPTION size_max = " + describe(o));
-                        note("size_max=" + describe(o));
-                    }
-                });
-        Td.send(new TdApi.GetOption("notification_group_count_max"),
-                new Client.ResultHandler() {
-                    @Override public void onResult(TdApi.Object o) {
-                        if (o instanceof TdApi.OptionValueInteger) {
-                            Log.i(TAG, "TDLib notification API "
-                                    + (((TdApi.OptionValueInteger) o).value > 0 ? "ON" : "OFF"));
-                        }
-                    }
-                });
-        note("service onCreate, options requested");
-        Log.i(TAG, "TDLib notification API enabled");
-    }
-
-    /**
-     * Writes a diagnostic line to a file.
-     *
-     * logcat on this device is a 256 KB ring that TDLib fills in seconds, so
-     * app logs vanish before they can be read. A file survives.
-     */
-    /** Process-wide diagnostic sink, so Td can trace without a Context. */
     private static volatile NotificationService instance;
-
-    static void traceLine(String line) {
-        NotificationService s = instance;
-        if (s != null) s.note(line);
-    }
 
     private void note(String line) {
         // Compiled out entirely in release: BuildConfig.DIAGNOSTICS is a
@@ -210,95 +139,69 @@ public class NotificationService extends Service {
         }
     }
 
-    private static String describe(TdApi.Object o) {
-        if (o instanceof TdApi.OptionValueInteger) {
-            return String.valueOf(((TdApi.OptionValueInteger) o).value);
-        }
-        if (o instanceof TdApi.Error) return "error " + ((TdApi.Error) o).code
-                + " " + ((TdApi.Error) o).message;
-        return String.valueOf(o);
-    }
-
-    // ---------------------------------------------------------------- state
-
-    /** The full set of groups TDLib had active at launch. */
-    void onActiveNotifications(TdApi.UpdateActiveNotifications u) {
-        Log.i(TAG, "active notifications: " + (u.groups == null ? 0 : u.groups.length));
+    void onActiveNotifications(TdApi.UpdateActiveNotifications update) {
         synchronized (groups) {
+            if (destroyed) return;
+            for (int id : groups.keySet()) nm.cancel(MESSAGE_TAG, id);
             groups.clear();
-            pending.clear();
-            if (u.groups != null) {
-                for (TdApi.NotificationGroup g : u.groups) {
-                    groups.put(g.id, g);
-                    for (TdApi.Notification n : g.notifications) {
-                        pending.put(n.id, n);
-                    }
-                    render(g);
+            for (TdApi.NotificationGroup group : update.groups) {
+                groups.put(group.id, group);
+                render(group, false);
+            }
+        }
+    }
+
+    void onNotification(TdApi.UpdateNotification update) {
+        synchronized (groups) {
+            if (destroyed) return;
+            TdApi.NotificationGroup group = groups.get(update.notificationGroupId);
+            if (group == null) return;
+            for (int i = 0; i < group.notifications.length; i++) {
+                if (group.notifications[i].id == update.notification.id) {
+                    group.notifications[i] = update.notification;
+                    render(group, false);
+                    return;
                 }
             }
         }
     }
 
-    /** A notification was changed in place. */
-    void onNotification(TdApi.UpdateNotification u) {
+    void onNotificationGroup(TdApi.UpdateNotificationGroup update) {
         synchronized (groups) {
-            pending.put(u.notification.id, u.notification);
-            for (TdApi.NotificationGroup g : groups.values()) {
-                for (TdApi.Notification n : g.notifications) {
-                    if (n.id == u.notification.id) {
-                        render(g);
-                        return;
-                    }
-                }
+            if (destroyed) return;
+            TdApi.NotificationGroup group = groups.get(update.notificationGroupId);
+            if (group == null) {
+                group = new TdApi.NotificationGroup();
+                group.id = update.notificationGroupId;
+                group.notifications = new TdApi.Notification[0];
             }
+            group.type = update.type;
+            group.chatId = update.chatId;
+            group.totalCount = update.totalCount;
+
+            Map<Integer, TdApi.Notification> byId = new LinkedHashMap<>();
+            for (TdApi.Notification n : group.notifications) byId.put(n.id, n);
+            for (int id : update.removedNotificationIds) byId.remove(id);
+            for (TdApi.Notification n : update.addedNotifications) byId.put(n.id, n);
+            if (byId.isEmpty() || group.totalCount == 0) {
+                groups.remove(group.id);
+                nm.cancel(MESSAGE_TAG, group.id);
+                return;
+            }
+            group.notifications = byId.values().toArray(new TdApi.Notification[0]);
+            groups.put(group.id, group);
+            render(group, update.addedNotifications.length > 0);
         }
     }
 
-    /** A group gained or lost notifications. */
-    void onNotificationGroup(TdApi.UpdateNotificationGroup u) {
-        Log.i(TAG, "group update id=" + u.notificationGroupId
-                + " chat=" + u.chatId + " added=" + u.addedNotifications.length
-                + " total=" + u.totalCount + " openChat=" + openChatId);
-        synchronized (groups) {
-            TdApi.NotificationGroup g = groups.get(u.notificationGroupId);
-            if (g == null) {
-                if (u.addedNotifications.length == 0) return;
-                g = new TdApi.NotificationGroup();
-                g.id = u.notificationGroupId;
-                g.type = u.type;
-                g.chatId = u.chatId;
-                g.notifications = new TdApi.Notification[0];
-                groups.put(g.id, g);
-            }
-            g.type = u.type;
-            g.chatId = u.chatId;
-            g.totalCount = u.totalCount;
-
-            for (TdApi.Notification n : u.addedNotifications) pending.put(n.id, n);
-            for (int removedId : u.removedNotificationIds) {
-                pending.remove(removedId);
-            }
-            // When the group drains entirely, TDLib reports it via totalCount 0
-            // and no remaining notifications; render() cancels then. Individual
-            // removals do not need their own cancel because this group shares
-            // one notification id on this platform.
-            render(g);
-        }
-    }
-
-    /** The user read a chat elsewhere: clear its notifications locally. */
     void onChatRead(long chatId, long lastReadInboxMessageId) {
         synchronized (groups) {
-            for (TdApi.NotificationGroup g : groups.values()) {
-                if (g.chatId != chatId) continue;
-                if (chatId == openChatId) {
-                    nm.cancel(g.id);
-                }
+            if (destroyed || chatId != openChatId) return;
+            for (TdApi.NotificationGroup group : groups.values()) {
+                if (group.chatId == chatId) nm.cancel(MESSAGE_TAG, group.id);
             }
         }
     }
-
-    // -------------------------------------------------------------- render
 
     /**
      * Renders one notification group.
@@ -308,18 +211,18 @@ public class NotificationService extends Service {
      * again with the same id replaces it, which is the pre-API-20 equivalent of
      * a summary line updating.
      */
-    private void render(TdApi.NotificationGroup g) {
+    private void render(TdApi.NotificationGroup g, boolean alert) {
         // Never notify for the chat on screen: it is already in front of them.
         if (g.chatId != 0 && g.chatId == openChatId) {
             note("render: skipped, chat " + g.chatId + " is open");
-            nm.cancel(g.id);
+            nm.cancel(MESSAGE_TAG, g.id);
             return;
         }
 
         TdApi.Notification latest = latestIn(g);
         if (latest == null) {
             note("render: no notification to show, cancelling");
-            nm.cancel(g.id);
+            nm.cancel(MESSAGE_TAG, g.id);
             return;
         }
 
@@ -328,7 +231,11 @@ public class NotificationService extends Service {
         String title = titleFor(g);
         String text = textFor(latest);
 
-        Notification.Builder b = new Notification.Builder(this)
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(
+                android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        Notification.Builder b = builder(latest.isSilent ? SILENT_CHANNEL : MESSAGE_CHANNEL)
                 .setSmallIcon(android.R.drawable.stat_notify_chat)
                 .setContentTitle(title)
                 .setContentText(text)
@@ -336,43 +243,24 @@ public class NotificationService extends Service {
                 .setWhen(System.currentTimeMillis())
                 .setAutoCancel(true);
 
-        try {
-            b.setStyle(new Notification.BigTextStyle().bigText(text));
-        } catch (Throwable ignored) {
-            // BigTextStyle is API 16+; if it is missing, the plain form stands.
-        }
-
-        if (latest.isSilent) {
-            b.setOnlyAlertOnce(true);
-        } else {
-            b.setDefaults(Notification.DEFAULT_ALL);
-        }
+        b.setStyle(new Notification.BigTextStyle().bigText(text));
+        b.setOnlyAlertOnce(!alert || latest.isSilent);
+        if (!latest.isSilent) b.setDefaults(Notification.DEFAULT_ALL);
 
         b.setContentIntent(openIntent(g));
         // Without a deleteIntent the service never learns the user cleared it,
         // and TDLib keeps believing the group is on screen.
-        b.setDeleteIntent(dismissIntent(g.id));
+        b.setDeleteIntent(dismissIntent(g.id, latest.id));
 
         Notification n = b.build();
-        nm.notify(g.id, n);
-        note("render: notified id=" + g.id + " title=" + title + " text=" + text);
+        nm.notify(MESSAGE_TAG, g.id, n);
+        note("render: notified id=" + g.id);
     }
 
-    /**
-     * Picks the newest notification for a group.
-     *
-     * Read from {@link #pending}, not from {@code g.notifications}. TDLib
-     * delivers notifications through UpdateNotification and only reports their
-     * ids in UpdateNotificationGroup.addedNotifications; the group object's own
-     * notifications array is never populated on this API, so reading it found
-     * nothing and every group was cancelled with "no notification to show".
-     */
-    private TdApi.Notification latestIn(TdApi.NotificationGroup g) {
+    private TdApi.Notification latestIn(TdApi.NotificationGroup group) {
         TdApi.Notification best = null;
-        synchronized (groups) {
-            for (TdApi.Notification n : pending.values()) {
-                if (best == null || n.date > best.date) best = n;
-            }
+        for (TdApi.Notification candidate : group.notifications) {
+            if (best == null || candidate.id > best.id) best = candidate;
         }
         return best;
     }
@@ -440,36 +328,65 @@ public class NotificationService extends Service {
 
     static final String ACTION_DISMISS = "ai.crystalgram.holo.DISMISS";
 
-    private PendingIntent dismissIntent(int groupId) {
+    private PendingIntent dismissIntent(int groupId, int maxId) {
         Intent i = new Intent(ACTION_DISMISS);
         i.setClass(this, DismissReceiver.class);
         i.putExtra("groupId", groupId);
+        i.putExtra("notificationId", maxId);
         return PendingIntent.getBroadcast(this, groupId, i,
-                PendingIntent.FLAG_UPDATE_CURRENT);
+                intentFlags());
     }
 
     private PendingIntent openIntent(TdApi.NotificationGroup g) {
-        Intent i = new Intent(this, ChatActivity.class);
-        i.putExtra(ChatActivity.EXTRA_CHAT_ID, g.chatId);
+        Intent i = new Intent().setClassName(this, LoginActivity.NOTIFICATION_ENTRY);
         TdApi.Chat c = Td.chat(g.chatId);
+        if (c == null || !MainActivity.ChatRow.isSupported(c.type)) {
+            return PendingIntent.getActivity(this, g.id, i, intentFlags());
+        }
+        i.putExtra(ChatActivity.EXTRA_CHAT_ID, g.chatId);
         if (c != null) i.putExtra(ChatActivity.EXTRA_TITLE, c.title);
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         return PendingIntent.getActivity(
-                this, g.id, i, PendingIntent.FLAG_UPDATE_CURRENT);
+                this, g.id, i, intentFlags());
     }
 
     /** The notification that says the service is running. */
     private Notification buildOngoing() {
-        Intent i = new Intent(this, MainActivity.class);
+        Intent i = new Intent(this, LoginActivity.class);
         PendingIntent pi = PendingIntent.getActivity(
-                this, 0, i, PendingIntent.FLAG_UPDATE_CURRENT);
+                this, 0, i, intentFlags());
 
-        return new Notification.Builder(this)
+        return builder(FOREGROUND_CHANNEL)
                 .setSmallIcon(android.R.drawable.stat_notify_chat)
                 .setContentTitle("CrystalGram")
                 .setContentText("Receiving messages")
                 .setContentIntent(pi)
                 .setOngoing(true)
                 .build();
+    }
+
+    private Notification.Builder builder(String channel) {
+        if (Build.VERSION.SDK_INT >= 26) return Api26.builder(this, channel);
+        return new Notification.Builder(this);
+    }
+
+    @TargetApi(26)
+    private static class Api26 {
+        static void start(Context context, Intent intent) {
+            context.startForegroundService(intent);
+        }
+
+        static Notification.Builder builder(Context context, String channel) {
+            return new Notification.Builder(context, channel);
+        }
+
+        static void createChannels(NotificationManager manager) {
+            manager.createNotificationChannel(new NotificationChannel(
+                    FOREGROUND_CHANNEL, "Connection", NotificationManager.IMPORTANCE_LOW));
+            manager.createNotificationChannel(new NotificationChannel(
+                    MESSAGE_CHANNEL, "Messages", NotificationManager.IMPORTANCE_DEFAULT));
+            manager.createNotificationChannel(new NotificationChannel(
+                    SILENT_CHANNEL, "Silent messages", NotificationManager.IMPORTANCE_LOW));
+        }
     }
 }

@@ -1,5 +1,8 @@
 package ai.crystalgram.holo;
 
+import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 
 import org.drinkless.tdlib.Client;
@@ -17,7 +20,13 @@ public final class Td {
 
     private static final String TAG = "CG-Td";
 
-    private static Client client;
+    private static volatile Client client;
+    private static final Handler main = new Handler(Looper.getMainLooper());
+    private static Context application;
+    private static NetworkMonitor network;
+    private static TdApi.AuthorizationState authorizationState;
+    private static String startupError;
+    private static boolean loggingOut;
     private static final Object lock = new Object();
     private static volatile long myId;
     private static final java.util.HashMap<Long, TdApi.Chat> chats =
@@ -25,7 +34,7 @@ public final class Td {
     private static final java.util.HashMap<Long, TdApi.User> users =
             new java.util.HashMap<Long, TdApi.User>();
 
-    /** Weak-ish references; activities register on resume and clear on pause. */
+    /** Activity references are cleared by their lifecycle callbacks. */
     private static volatile LoginActivity login;
     private static volatile MainActivity chatList;
     private static volatile ChatActivity conversation;
@@ -40,9 +49,105 @@ public final class Td {
 
     private Td() {}
 
-    static synchronized void ensureStarted() {
+    // Startup and authorization transitions are serialized on the main looper.
+    static void ensureStarted(Context context) {
         if (client != null) return;
-        client = Client.create(new Dispatcher(), null, null);
+        application = context.getApplicationContext();
+        startupError = null;
+        authorizationState = null;
+        System.loadLibrary("tdjni");
+        client = Client.create(new Dispatcher(), null, new Client.ExceptionHandler() {
+            @Override public void onException(Throwable error) {
+                Log.e(TAG, "TDLib callback failed", error);
+            }
+        });
+        if (network == null) {
+            network = new NetworkMonitor(application);
+            network.start();
+        } else {
+            network.sync("client restart");
+        }
+    }
+
+    static boolean authorized() {
+        return !loggingOut && authorizationState instanceof TdApi.AuthorizationStateReady;
+    }
+
+    static void beginLogout() {
+        loggingOut = true;
+    }
+
+    static void onLogoutError(final TdApi.Error error) {
+        Log.w(TAG, "LogOut failed: " + error.code);
+        main.post(new Runnable() {
+            @Override public void run() {
+                loggingOut = false;
+                if (login != null && authorized()) {
+                    login.onAuthorizationState(authorizationState);
+                }
+            }
+        });
+    }
+
+    private static void updateAuthorization(TdApi.AuthorizationState state) {
+        authorizationState = state;
+        if (state instanceof TdApi.AuthorizationStateWaitTdlibParameters) {
+            TdApi.SetTdlibParameters params = new TdApi.SetTdlibParameters();
+            params.databaseDirectory = application.getDir("tdlib", Context.MODE_PRIVATE)
+                    .getAbsolutePath();
+            params.useMessageDatabase = true;
+            params.apiId = BuildConfig.TG_API_ID;
+            params.apiHash = BuildConfig.TG_API_HASH;
+            params.systemLanguageCode = "en";
+            params.deviceModel = android.os.Build.MODEL;
+            params.systemVersion = android.os.Build.VERSION.RELEASE;
+            params.applicationVersion = BuildConfig.VERSION_NAME;
+            send(params, new Client.ResultHandler() {
+                @Override public void onResult(TdApi.Object result) {
+                    if (!(result instanceof TdApi.Error)) return;
+                    final String message = ((TdApi.Error) result).message;
+                    main.post(new Runnable() {
+                        @Override public void run() {
+                            startupError = message;
+                            if (login != null) login.showError(message);
+                            NotificationService service = notifier;
+                            if (service != null) service.stopSelf();
+                        }
+                    });
+                }
+            });
+        } else if (state instanceof TdApi.AuthorizationStateReady) {
+            send(new TdApi.GetMe(), new Client.ResultHandler() {
+                @Override public void onResult(TdApi.Object result) {
+                    if (result instanceof TdApi.User) myId = ((TdApi.User) result).id;
+                }
+            });
+        } else if (state instanceof TdApi.AuthorizationStateWaitPhoneNumber
+                || state instanceof TdApi.AuthorizationStateLoggingOut
+                || state instanceof TdApi.AuthorizationStateClosed) {
+            NotificationService service = notifier;
+            if (service != null) service.stopSelf();
+        }
+
+        if (state instanceof TdApi.AuthorizationStateClosed) {
+            loggingOut = false;
+            client = null;
+            myId = 0;
+            MediaLoader.reset();
+            connectionState = null;
+            synchronized (lock) {
+                chats.clear();
+                users.clear();
+            }
+            if (login != null) {
+                login.onAuthorizationState(state);
+                ensureStarted(application);
+                return;
+            }
+        }
+        if (login != null) login.onAuthorizationState(state);
+        NotificationService service = notifier;
+        if (service != null && authorized()) service.onAuthorized();
     }
 
     /** Our own user id, learned from the authorization state. */
@@ -55,14 +160,14 @@ public final class Td {
         synchronized (lock) { return chats.get(id); }
     }
 
+    static void cacheChat(TdApi.Chat chat) {
+        synchronized (lock) { chats.put(chat.id, chat); }
+    }
+
     static TdApi.User user(long id) {
         synchronized (lock) { return users.get(id); }
     }
 
-    /** The shared client; null until ensureStarted(). */
-    static Client client() { return client; }
-
-    static void setMe(long id) { myId = id; }
 
     static void send(TdApi.Function<?> query) {
         send(query, null);
@@ -72,6 +177,7 @@ public final class Td {
         Client c = client;
         if (c == null) {
             Log.w(TAG, "send before client started: " + query.getClass().getSimpleName());
+            if (handler != null) handler.onResult(new TdApi.Error(503, "Telegram is starting"));
             return;
         }
         c.send(query, handler);
@@ -79,35 +185,11 @@ public final class Td {
 
     static void setNotifier(NotificationService s) {
         notifier = s;
-        trace("setNotifier " + (s != null ? "attached" : "cleared"));
-    }
-
-    /**
-     * Appends a diagnostic line to a file.
-     *
-     * logcat on this device is a 256 KB ring that TDLib fills within seconds,
-     * so anything the app logs is evicted before it can be read. A file
-     * survives, and is the only reliable way to see what TDLib is dispatching.
-     */
-    private static void trace(String line) {
-        try {
-            java.io.File f = new java.io.File(
-                    android.os.Environment.getDataDirectory(), "data/ai.crystalgram.holo");
-            // Cannot write another app's dir; the service appends instead.
-            NotificationService.traceLine(line);
-        } catch (Throwable ignored) {
-            // never let diagnostics break the dispatcher
-        }
     }
 
     static void setConnectionListener(ConnectionListener l) { connectionListener = l; }
 
     static TdApi.ConnectionState connectionState() { return connectionState; }
-
-    /** True when TDLib can talk to the server. */
-    static boolean isReady() {
-        return connectionState instanceof TdApi.ConnectionStateReady;
-    }
 
     /**
      * The "online" option tells TDLib whether the user is actively present.
@@ -119,7 +201,17 @@ public final class Td {
         send(new TdApi.SetOption("online", new TdApi.OptionValueBoolean(online)));
     }
 
-    static void setLogin(LoginActivity a) { login = a; }
+    static void setLogin(LoginActivity a) {
+        login = a;
+        if (loggingOut) {
+            a.onAuthorizationState(new TdApi.AuthorizationStateLoggingOut());
+        } else if (authorizationState instanceof TdApi.AuthorizationStateClosed) {
+            ensureStarted(application);
+        } else if (authorizationState != null) {
+            a.onAuthorizationState(authorizationState);
+        }
+        if (startupError != null) a.showError(startupError);
+    }
     static void clearLogin(LoginActivity a) { if (login == a) login = null; }
 
     static void bindChatList(MainActivity a) { chatList = a; }
@@ -159,11 +251,15 @@ public final class Td {
                 ConnectionListener l = connectionListener;
                 if (l != null) l.onConnectionState(st);
 
-            } else if (object instanceof TdApi.UpdateFile) {
-                TdApi.UpdateFile u = (TdApi.UpdateFile) object;
-                MediaLoader.get().onFileUpdated(u.file);
-                ChatActivity c = conversation;
-                if (c != null) c.onFileUpdated(u.file);
+            } else if (object instanceof TdApi.UpdateMessageContent) {
+                TdApi.UpdateMessageContent update = (TdApi.UpdateMessageContent) object;
+                ChatActivity chat = conversation;
+                if (chat != null) chat.onMessageContent(update);
+
+            } else if (object instanceof TdApi.UpdateDeleteMessages) {
+                TdApi.UpdateDeleteMessages update = (TdApi.UpdateDeleteMessages) object;
+                ChatActivity chat = conversation;
+                if (chat != null && !update.fromCache) chat.onMessagesDeleted(update);
 
             } else if (object instanceof TdApi.UpdateUser) {
                 TdApi.UpdateUser u = (TdApi.UpdateUser) object;
@@ -171,29 +267,30 @@ public final class Td {
 
             } else if (object instanceof TdApi.UpdateNotificationGroup) {
                 TdApi.UpdateNotificationGroup u = (TdApi.UpdateNotificationGroup) object;
-                trace("UpdateNotificationGroup group=" + u.notificationGroupId
-                        + " added=" + u.addedNotifications.length
-                        + " notifier=" + (notifier != null));
-                if (notifier != null) notifier.onNotificationGroup(u);
+                NotificationService service = notifier;
+                if (service != null) service.onNotificationGroup(u);
 
             } else if (object instanceof TdApi.UpdateNotification) {
                 TdApi.UpdateNotification u = (TdApi.UpdateNotification) object;
-                if (notifier != null) notifier.onNotification(u);
+                NotificationService service = notifier;
+                if (service != null) service.onNotification(u);
 
             } else if (object instanceof TdApi.UpdateActiveNotifications) {
                 TdApi.UpdateActiveNotifications u = (TdApi.UpdateActiveNotifications) object;
-                if (notifier != null) notifier.onActiveNotifications(u);
+                NotificationService service = notifier;
+                if (service != null) service.onActiveNotifications(u);
 
             } else if (object instanceof TdApi.UpdateChatReadInbox) {
                 TdApi.UpdateChatReadInbox u = (TdApi.UpdateChatReadInbox) object;
-                if (notifier != null) notifier.onChatRead(u.chatId, u.lastReadInboxMessageId);
+                NotificationService service = notifier;
+                if (service != null) service.onChatRead(u.chatId, u.lastReadInboxMessageId);
                 MainActivity a = chatList;
                 if (a != null) a.onChatUpdated(u.chatId);
 
             } else if (object instanceof TdApi.UpdateChatAction) {
                 TdApi.UpdateChatAction u = (TdApi.UpdateChatAction) object;
                 ChatActivity c = conversation;
-                if (c != null) c.onChatAction(u.senderId, u.action);
+                if (c != null) c.onChatAction(u.chatId, u.senderId, u.action);
 
             } else if (object instanceof TdApi.UpdateNewMessage) {
                 ChatActivity c = conversation;
@@ -201,7 +298,7 @@ public final class Td {
 
             } else if (object instanceof TdApi.UpdateMessageSendSucceeded) {
                 TdApi.UpdateMessageSendSucceeded ok = (TdApi.UpdateMessageSendSucceeded) object;
-                UploadCleanup.onSent(ok.message);
+                UploadCleanup.onSent(ok.message.chatId, ok.oldMessageId);
                 ChatActivity c = conversation;
                 if (c != null) {
                     TdApi.UpdateMessageSendSucceeded u = (TdApi.UpdateMessageSendSucceeded) object;
@@ -210,7 +307,7 @@ public final class Td {
 
             } else if (object instanceof TdApi.UpdateMessageSendFailed) {
                 TdApi.UpdateMessageSendFailed bad = (TdApi.UpdateMessageSendFailed) object;
-                UploadCleanup.onFailed(bad.message);
+                UploadCleanup.onFailed(bad.message.chatId, bad.oldMessageId);
                 ChatActivity c = conversation;
                 if (c != null) {
                     TdApi.UpdateMessageSendFailed u = (TdApi.UpdateMessageSendFailed) object;
@@ -218,15 +315,11 @@ public final class Td {
                 }
 
             } else if (object instanceof TdApi.UpdateAuthorizationState) {
-                LoginActivity l = login;
-                if (l != null) {
-                    l.onAuthorizationState(
-                            ((TdApi.UpdateAuthorizationState) object).authorizationState);
-                }
-            } else if (object instanceof TdApi.UpdateChatActionBar) {
-                // ignore
-            } else if (object instanceof TdApi.UpdateOption) {
-                // ignore; used only for the version probe
+                final TdApi.AuthorizationState state =
+                        ((TdApi.UpdateAuthorizationState) object).authorizationState;
+                main.post(new Runnable() {
+                    @Override public void run() { updateAuthorization(state); }
+                });
             }
         }
     }

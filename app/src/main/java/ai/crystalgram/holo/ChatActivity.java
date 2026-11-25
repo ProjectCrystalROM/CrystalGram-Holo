@@ -64,9 +64,12 @@ public class ChatActivity extends Activity {
     private long oldestMessageId;
     private Runnable typingHide;
     private TextView connBanner;
-    private NetworkMonitor net;
-    /** The activity root, kept so nothing has to search for it. */
-    private LinearLayout layoutRoot;
+    private boolean resumed;
+    private boolean sendingText;
+    private boolean historyLoading;
+    private boolean noOlderHistory;
+    private boolean initialHistory = true;
+    private int historyGeneration;
     /** Wall clock of the last typing notification we sent to the server. */
     private long lastTypingSent;
     /** ChatActionTyping repeats are throttled to this interval. */
@@ -89,7 +92,6 @@ public class ChatActivity extends Activity {
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        layoutRoot = root;
 
         connBanner = new TextView(this);
         connBanner.setTextSize(13);
@@ -112,6 +114,7 @@ public class ChatActivity extends Activity {
 
             @Override
             public void onScroll(android.widget.AbsListView v, int first, int visible, int total) {
+                if (resumed && visible > 0) markVisibleAsRead();
                 // Reaching the top means "give me older messages".
                 if (first == 0 && adapter.getCount() > 0 && oldestMessageId != 0) {
                     loadOlder();
@@ -132,12 +135,6 @@ public class ChatActivity extends Activity {
         entry.setOrientation(LinearLayout.HORIZONTAL);
         entry.setGravity(Gravity.CENTER_VERTICAL);
         entry.setPadding(dp(8), dp(6), dp(8), dp(6));
-
-        new Thread(new Runnable() {
-            @Override public void run() {
-                UploadCleanup.sweep(new File(getCacheDir(), "outgoing"));
-            }
-        }, "cg-sweep").start();
 
         input = new EditText(this);
         input.setHint("Message");
@@ -165,27 +162,47 @@ public class ChatActivity extends Activity {
 
         setContentView(root);
 
-        Td.send(new TdApi.OpenChat(chatId));
-        NotificationService.setOpenChat(chatId);
-        MediaLoader.get().addListener(mediaListener);
-        loadNewest();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        if (!Td.authorized() || chatId == 0) {
+            startActivity(new Intent(this, LoginActivity.class));
+            finish();
+            return;
+        }
+        resumed = true;
         Td.bindConversation(this);
+        Td.setOnline(true);
+        Td.send(new TdApi.OpenChat(chatId));
+        NotificationService.setOpenChat(chatId);
+        MediaLoader.get().addListener(mediaListener);
+        startNetworkWatch();
+        loadHistory(0);
     }
 
     @Override
     protected void onPause() {
-        Td.unbindConversation(this);
+        if (resumed) {
+            resumed = false;
+            historyGeneration++;
+            historyLoading = false;
+            Td.setConnectionListener(null);
+            MediaLoader.get().removeListener(mediaListener);
+            NotificationService.setOpenChat(0);
+            clearTyping();
+            hideTyping();
+            Td.send(new TdApi.CloseChat(chatId));
+            Td.setOnline(false);
+        }
         super.onPause();
     }
 
     @Override
     protected void onDestroy() {
-        Td.send(new TdApi.CloseChat(chatId));
+        Td.unbindConversation(this);
+        ui.removeCallbacksAndMessages(null);
         super.onDestroy();
     }
 
@@ -193,44 +210,43 @@ public class ChatActivity extends Activity {
         return (int) (v * density);
     }
 
-    /**
-     * Newest page. Per td_api.tl: "use 0 to get results from the last message".
-     */
-    private void loadNewest() {
-        Td.send(new TdApi.GetChatHistory(chatId, 0L, 0, 50, false), historyHandler(true));
-    }
-
-    /**
-     * One page further back. from_message_id is exclusive going backwards, so
-     * asking from the oldest id we hold returns the messages before it.
-     */
     private void loadOlder() {
-        if (oldestMessageId == 0) return;
-        final long from = oldestMessageId;
-        oldestMessageId = 0;   // guard against repeat requests while in flight
-        Td.send(new TdApi.GetChatHistory(chatId, from, 0, 50, false), historyHandler(false));
+        if (oldestMessageId != 0 && !noOlderHistory) loadHistory(oldestMessageId);
     }
 
-    private Client.ResultHandler historyHandler(final boolean replace) {
-        return new Client.ResultHandler() {
-            @Override public void onResult(TdApi.Object object) {
-                if (object instanceof TdApi.Messages) {
-                    TdApi.Messages m = (TdApi.Messages) object;
-                    Log.i(TAG, (replace ? "history" : "older") + ": total=" + m.totalCount
-                            + " returned=" + (m.messages == null ? 0 : m.messages.length));
-                    if (m.messages == null || m.messages.length == 0) {
-                        oldestMessageId = 0;
-                        return;
+    private void loadHistory(final long from) {
+        if (!resumed || historyLoading) return;
+        historyLoading = true;
+        final int generation = historyGeneration;
+        Td.send(new TdApi.GetChatHistory(chatId, from, 0, 50, false),
+                new Client.ResultHandler() {
+                    @Override public void onResult(final TdApi.Object result) {
+                        ui.post(new Runnable() {
+                            @Override public void run() {
+                                if (generation != historyGeneration || !resumed) return;
+                                if (result instanceof TdApi.Messages) {
+                                    TdApi.Message[] messages = ((TdApi.Messages) result).messages;
+                                    View anchor = list.getChildAt(0);
+                                    int first = list.getFirstVisiblePosition();
+                                    int top = anchor == null ? 0 : anchor.getTop();
+                                    int before = adapter.getCount();
+                                    boolean atBottom = before == 0 || list.getLastVisiblePosition() == before - 1;
+                                    int added = adapter.mergeHistory(messages);
+                                    if (from != 0) {
+                                        noOlderHistory = added == 0;
+                                        if (added != 0) list.setSelectionFromTop(first + added, top);
+                                    } else if (initialHistory || atBottom) {
+                                        initialHistory = false;
+                                        scrollToBottom();
+                                    }
+                                } else if (result instanceof TdApi.Error) {
+                                    Log.w(TAG, "GetChatHistory: " + ((TdApi.Error) result).message);
+                                }
+                                historyLoading = false;
+                            }
+                        });
                     }
-                    if (replace) onHistory(chatId, m.messages);
-                    else onOlderHistory(chatId, m.messages);
-                } else if (object instanceof TdApi.Error) {
-                    TdApi.Error e = (TdApi.Error) object;
-                    Log.w(TAG, "GetChatHistory failed: " + e.message);
-                    oldestMessageId = 0;
-                }
-            }
-        };
+                });
     }
 
     private static final int REQ_PICK = 1001;
@@ -249,37 +265,42 @@ public class ChatActivity extends Activity {
     }
 
     private void sendMessage() {
-        String text = input.getText().toString().trim();
-        if (text.length() == 0) return;
+        String text = input.getText().toString();
+        if (sendingText || text.trim().length() == 0) return;
+        sendingText = true;
         TdApi.InputMessageText content = new TdApi.InputMessageText();
         content.text = new TdApi.FormattedText(text, null);
+        final String draft = text;
         Td.send(new TdApi.SendMessage(chatId, null, null,
-                new TdApi.MessageSendOptions(), null, content));
-        input.setText("");
-    }
-
-    // -------------------------------------------------------- TDLib -> UI hooks
-
-    void onHistory(long id, TdApi.Message[] messages) {
-        if (id != chatId || messages == null) return;
-        final List<TdApi.Message> batch = new ArrayList<TdApi.Message>();
-        for (TdApi.Message m : messages) batch.add(m);
-        ui.post(new Runnable() {
-            @Override public void run() {
-                adapter.setHistory(batch);
-                scrollToBottom();
-                // The newest page was just opened, so the user has seen it.
-                // Do not consult the ListView here: it has not laid out yet
-                // (getLastVisiblePosition() == -1) in this same pass.
-                markMessagesAsRead(batch);
+                new TdApi.MessageSendOptions(), null, content), new Client.ResultHandler() {
+            @Override public void onResult(final TdApi.Object result) {
+                ui.post(new Runnable() {
+                    @Override public void run() {
+                        sendingText = false;
+                        if (isFinishing()) return;
+                        if (result instanceof TdApi.Error) {
+                            Toast.makeText(ChatActivity.this, ((TdApi.Error) result).message,
+                                    Toast.LENGTH_LONG).show();
+                        } else if (result instanceof TdApi.Message
+                                && draft.equals(input.getText().toString())) {
+                            input.setText("");
+                        }
+                    }
+                });
             }
         });
     }
 
+    // -------------------------------------------------------- TDLib -> UI hooks
+
     /** UpdateChatAction: someone else started or stopped typing. */
-    void onChatAction(final TdApi.MessageSender sender, final TdApi.ChatAction action) {
+    void onChatAction(long id, final TdApi.MessageSender sender, final TdApi.ChatAction action) {
+        if (id != chatId) return;
+        if (sender instanceof TdApi.MessageSenderUser
+                && ((TdApi.MessageSenderUser) sender).userId == Td.me()) return;
         ui.post(new Runnable() {
             @Override public void run() {
+                if (!resumed) return;
                 String who = senderName(sender);
                 if (action instanceof TdApi.ChatActionTyping) {
                     showTyping(who == null ? "typing\u2026" : who + " is typing\u2026");
@@ -320,23 +341,14 @@ public class ChatActivity extends Activity {
         typingLabel.setVisibility(View.GONE);
     }
 
-    void onOlderHistory(long id, TdApi.Message[] messages) {
-        if (id != chatId || messages == null || messages.length == 0) return;
-        final List<TdApi.Message> batch = new ArrayList<TdApi.Message>();
-        for (TdApi.Message m : messages) batch.add(m);
-        ui.post(new Runnable() {
-            @Override public void run() {
-                adapter.prependOlder(batch);
-            }
-        });
-    }
-
     void onNewMessage(final TdApi.Message message) {
         if (message.chatId != chatId) return;
         ui.post(new Runnable() {
             @Override public void run() {
+                boolean atBottom = adapter.getCount() == 0
+                        || list.getLastVisiblePosition() == adapter.getCount() - 1;
                 adapter.upsert(message);
-                scrollToBottom();
+                if (resumed && (atBottom || message.isOutgoing)) scrollToBottom();
             }
         });
     }
@@ -359,6 +371,39 @@ public class ChatActivity extends Activity {
         });
     }
 
+    void onMessageContent(final TdApi.UpdateMessageContent update) {
+        if (update.chatId != chatId) return;
+        ui.post(new Runnable() {
+            @Override public void run() {
+                for (TdApi.Message message : adapter.items) {
+                    if (message.id == update.messageId) {
+                        message.content = update.newContent;
+                        adapter.notifyDataSetChanged();
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    void onMessagesDeleted(final TdApi.UpdateDeleteMessages update) {
+        if (update.chatId != chatId) return;
+        ui.post(new Runnable() {
+            @Override public void run() {
+                if (update.isPermanent) {
+                    for (long id : update.messageIds) adapter.deleted.add(id);
+                }
+                Set<Long> removed = new HashSet<>();
+                for (long id : update.messageIds) removed.add(id);
+                java.util.Iterator<TdApi.Message> messages = adapter.items.iterator();
+                while (messages.hasNext()) {
+                    if (removed.contains(messages.next().id)) messages.remove();
+                }
+                adapter.publish();
+            }
+        });
+    }
+
     /**
      * Telegram API ToS 1.4 forbids interfering with typing status, in either
      * direction: we must report our own typing, and we must show others'.
@@ -368,6 +413,7 @@ public class ChatActivity extends Activity {
      * clears it as soon as the draft empties.
      */
     private void onDraftChanged(boolean hasText) {
+        if (!resumed) return;
         long now = android.os.SystemClock.elapsedRealtime();
         if (hasText) {
             if (!typingSent || now - lastTypingSent >= TYPING_INTERVAL_MS) {
@@ -398,38 +444,13 @@ public class ChatActivity extends Activity {
     private final MediaLoader.Listener mediaListener = new MediaLoader.Listener() {
         @Override public void onMediaUpdated(long ignoredChatId, int fileId) {
             ui.post(new Runnable() {
-                @Override public void run() { adapter.notifyDataSetChanged(); }
+                @Override public void run() { if (resumed) adapter.notifyDataSetChanged(); }
             });
         }
     };
 
-    /** TDLib told us a file changed; decode it if it is now local. */
-    void onFileUpdated(final TdApi.File file) {
-        if (file == null || file.local == null) return;
-        if (!file.local.isDownloadingCompleted) return;
-        MediaLoader.get().decodeAsync(file, dp(320));
-    }
-
     private void scrollToBottom() {
         if (adapter.getCount() > 0) list.setSelection(adapter.getCount() - 1);
-        markVisibleAsRead();
-    }
-
-    /**
-     * Telegram API ToS 1.4 forbids tampering with read statuses -- the client
-     * must report what the user has actually seen. TDLib only marks messages
-     * read once it is told they were viewed; OpenChat alone is not enough.
-     *
-     * The messages currently on screen are the newest ones, so this sends their
-     * ids with force_read = false, letting TDLib decide based on chat state.
-     */
-    /** Marks an explicit batch as read, regardless of layout state. */
-    private void markMessagesAsRead(List<TdApi.Message> messages) {
-        List<Long> ids = new ArrayList<Long>();
-        for (TdApi.Message m : messages) {
-            if (m != null && !m.isOutgoing) ids.add(m.id);
-        }
-        sendViewMessages(ids);
     }
 
     private void sendViewMessages(List<Long> ids) {
@@ -439,6 +460,8 @@ public class ChatActivity extends Activity {
         for (int i = 0; i < arr.length; i++) arr[i] = ids.get(i);
         Td.send(new TdApi.ViewMessages(chatId, arr, null, false));
     }
+
+    private long lastViewedIncomingId;
 
     private void markVisibleAsRead() {
         if (adapter.getCount() == 0) return;
@@ -452,74 +475,55 @@ public class ChatActivity extends Activity {
             TdApi.Message m = (TdApi.Message) adapter.getItem(i);
             if (m != null && !m.isOutgoing) ids.add(m.id);
         }
+        if (ids.isEmpty()) return;
+        long newest = ids.get(ids.size() - 1);
+        if (newest <= lastViewedIncomingId) return;
+        lastViewedIncomingId = newest;
         sendViewMessages(ids);
     }
 
     // ------------------------------------------------------------------ adapter
 
     private class MessageAdapter extends BaseAdapter {
+        private final Set<Long> deleted = new HashSet<>();
         private final List<TdApi.Message> items = new ArrayList<TdApi.Message>();
         private final Set<Long> failed = new HashSet<Long>();
 
-        void setHistory(List<TdApi.Message> history) {
-            items.clear();
-            failed.clear();
-            // TDLib returns newest first; the list wants oldest first.
-            for (int i = history.size() - 1; i >= 0; i--) items.add(history.get(i));
-            updateOldest();
+        int mergeHistory(TdApi.Message[] page) {
+            if (page == null) return 0;
+            Set<Long> known = new HashSet<>();
+            for (TdApi.Message message : items) known.add(message.id);
+            int before = items.size();
+            for (TdApi.Message message : page) {
+                if (message != null && !deleted.contains(message.id) && known.add(message.id)) items.add(message);
+            }
+            if (items.size() != before) publish();
+            return items.size() - before;
+        }
+
+        private void publish() {
+            java.util.Collections.sort(items, new java.util.Comparator<TdApi.Message>() {
+                @Override public int compare(TdApi.Message a, TdApi.Message b) {
+                    if (a.id == b.id) return 0;
+                    return a.id < b.id ? -1 : 1;
+                }
+            });
+            oldestMessageId = items.isEmpty() ? 0 : items.get(0).id;
             notifyDataSetChanged();
         }
 
-        /** Older page: TDLib returns newest-first, so reverse and prepend. */
-        void prependOlder(List<TdApi.Message> older) {
-            java.util.HashSet<Long> have = new java.util.HashSet<Long>();
-            for (TdApi.Message m : items) have.add(m.id);
-            int added = 0;
-            for (int i = older.size() - 1; i >= 0; i--) {
-                TdApi.Message m = older.get(i);
-                if (!have.contains(m.id)) {
-                    items.add(0, m);
-                    added++;
-                }
-            }
-            updateOldest();
-            if (added > 0) notifyDataSetChanged();
+        void upsert(TdApi.Message message) {
+            replaceById(message.id, message);
         }
 
-        private void updateOldest() {
-            oldestMessageId = 0;
-            for (TdApi.Message m : items) {
-                if (oldestMessageId == 0 || m.id < oldestMessageId) oldestMessageId = m.id;
+        void replaceById(long oldId, TdApi.Message message) {
+            for (int i = items.size() - 1; i >= 0; i--) {
+                long id = items.get(i).id;
+                if (id == oldId || id == message.id) items.remove(i);
             }
-        }
-
-        void upsert(TdApi.Message m) {
-            for (int i = 0; i < items.size(); i++) {
-                if (items.get(i).id == m.id) {
-                    items.set(i, m);
-                    notifyDataSetChanged();
-                    return;
-                }
-            }
-            items.add(m);
-            notifyDataSetChanged();
-        }
-
-        /**
-         * A sent message changes id when the server acknowledges it:
-         * SendMessage/UpdateNewMessage carry a temporary id, then
-         * UpdateMessageSendSucceeded reports the real one via oldMessageId.
-         * Without this the same text renders twice.
-         */
-        void replaceById(long oldId, TdApi.Message m) {
-            for (int i = 0; i < items.size(); i++) {
-                if (items.get(i).id == oldId) {
-                    items.set(i, m);
-                    notifyDataSetChanged();
-                    return;
-                }
-            }
-            upsert(m);
+            failed.remove(oldId);
+            items.add(message);
+            publish();
         }
 
         void markFailed(long id, String reason) {
@@ -539,7 +543,7 @@ public class ChatActivity extends Activity {
             String text = textOf(m);
             String time = timeOf(m);
             MediaVm media = MediaVm.of(m, MediaLoader.get());
-            row.bind(withTimestamp(text, time, outgoing, failed.contains(m.id)),
+            row.bind(withTimestamp(text, time, outgoing, failed.contains(m.id) || m.sendingState instanceof TdApi.MessageSendingStateFailed),
                     outgoing, media, iconFor(m));
             return row;
         }
@@ -702,11 +706,7 @@ public class ChatActivity extends Activity {
                 }
             }
 
-            if (media.state == MediaVm.DOWNLOADING) {
-                progress.setVisibility(VISIBLE);
-                progress.setIndeterminate(false);
-                progress.setProgress(media.percent());
-            } else if (media.state == MediaVm.PENDING) {
+            if (media.state == MediaVm.PENDING || media.state == MediaVm.DOWNLOADING) {
                 progress.setVisibility(VISIBLE);
                 progress.setIndeterminate(true);
             } else {
@@ -725,20 +725,14 @@ public class ChatActivity extends Activity {
      * Upstream Telegram shows this too; the states come straight from TDLib.
      */
     private void startNetworkWatch() {
-        if (net == null) net = new NetworkMonitor(this);
-        net.start(new NetworkMonitor.Listener() {
-            @Override public void onNetworkAvailable(boolean available, TdApi.NetworkType type) {
-                runOnUiThread(new Runnable() {
-                    @Override public void run() {
-                        if (available && Td.isReady()) hideConnBanner();
-                    }
-                });
-            }
-        });
         Td.setConnectionListener(new Td.ConnectionListener() {
             @Override public void onConnectionState(final TdApi.ConnectionState st) {
                 runOnUiThread(new Runnable() {
-                    @Override public void run() { showConnState(st); }
+                    @Override public void run() {
+                        if (!resumed) return;
+                        showConnState(st);
+                        if (st instanceof TdApi.ConnectionStateReady && adapter.getCount() == 0) loadHistory(0);
+                    }
                 });
             }
         });
@@ -747,7 +741,7 @@ public class ChatActivity extends Activity {
 
     private void showConnState(TdApi.ConnectionState st) {
         if (st instanceof TdApi.ConnectionStateReady) {
-            hideConnBanner();
+            connBanner.setVisibility(View.GONE);
             return;
         }
         String text;
@@ -766,9 +760,7 @@ public class ChatActivity extends Activity {
         connBanner.setVisibility(View.VISIBLE);
     }
 
-    private void hideConnBanner() {
-        connBanner.setVisibility(View.GONE);
-    }
+
 
     // ---- sending media ----------------------------------------------------
 
@@ -785,7 +777,7 @@ public class ChatActivity extends Activity {
         i.addCategory(Intent.CATEGORY_OPENABLE);
         try {
             startActivityForResult(i, REQ_PICK);
-        } catch (Throwable t) {
+        } catch (android.content.ActivityNotFoundException e) {
             Toast.makeText(this, "No file picker available", Toast.LENGTH_LONG).show();
         }
     }
@@ -796,9 +788,7 @@ public class ChatActivity extends Activity {
         if (req != REQ_PICK || res != RESULT_OK || data == null) return;
         final Uri uri = data.getData();
         if (uri == null) return;
-        final String mime = getContentResolver().getType(uri);
-        String name = displayNameOf(uri);
-        sendPicked(uri, mime, name);
+        sendPicked(uri);
     }
 
     private String displayNameOf(Uri uri) {
@@ -828,12 +818,19 @@ public class ChatActivity extends Activity {
      * All of it happens off the UI thread: a 3 MP decode is seconds of work on
      * a Cortex-A7 and would freeze the compose bar.
      */
-    private void sendPicked(final Uri uri, final String mime, final String name) {
-        final boolean slow = isSlowLink();
+    private void sendPicked(final Uri uri) {
         Toast.makeText(this, "Preparing\u2026", Toast.LENGTH_SHORT).show();
         new Thread(new Runnable() {
             @Override public void run() {
                 try {
+                    boolean slow = isSlowLink();
+                    String mime = getContentResolver().getType(uri);
+                    String name = displayNameOf(uri);
+                    if (mime == null) {
+                        int dot = name.lastIndexOf('.');
+                        if (dot >= 0) mime = android.webkit.MimeTypeMap.getSingleton()
+                                .getMimeTypeFromExtension(name.substring(dot + 1).toLowerCase(java.util.Locale.US));
+                    }
                     UploadPrep.Kind kind = UploadPrep.kindOf(mime);
 
                     // Prefer the file that already exists; copy only when the
@@ -845,29 +842,34 @@ public class ChatActivity extends Activity {
 
                     File toSend = staged;
                     if (kind == UploadPrep.Kind.PHOTO && slow) {
-                        toSend = UploadPrep.shrinkPhoto(staged,
+                        toSend = UploadPrep.shrinkPhoto(ChatActivity.this, staged,
                                 UploadPrep.MOBILE_MAX_PX, UploadPrep.MOBILE_QUALITY);
                     }
 
-                    final String note = UploadPrep.estimate((int) toSend.length(), slow);
+                    if (!staged.equals(toSend) && UploadPrep.isStaged(ChatActivity.this, staged)) {
+                        UploadCleanup.discard(staged);
+                    }
+
+                    final String note = UploadPrep.estimate(toSend.length(), slow);
+                    final int[] dimensions = kind == UploadPrep.Kind.PHOTO
+                            ? UploadPrep.dimensionsOf(toSend) : null;
                     final File finalFile = toSend;
                     final UploadPrep.Kind finalKind = kind;
-                    final String finalName = name;
-                    final String finalMime = mime;
 
                     ui.post(new Runnable() {
                         @Override public void run() {
-                            if (note != null) {
+                            if (note != null && !isFinishing()) {
                                 Toast.makeText(ChatActivity.this,
                                         UploadPrep.sizeLabel(finalFile.length()) + " \u00b7 " + note,
                                         Toast.LENGTH_LONG).show();
                             }
-                            sendFile(finalFile, finalKind, finalName, finalMime);
+                            sendFile(finalFile, finalKind, dimensions);
                         }
                     });
-                } catch (final Throwable t) {
+                } catch (final Exception t) {
                     ui.post(new Runnable() {
                         @Override public void run() {
+                            if (isFinishing()) return;
                             Toast.makeText(ChatActivity.this,
                                     "Could not prepare file: " + t.getMessage(),
                                     Toast.LENGTH_LONG).show();
@@ -878,16 +880,15 @@ public class ChatActivity extends Activity {
         }, "cg-upload").start();
     }
 
-    private void sendFile(File f, UploadPrep.Kind kind, String name, String mime) {
+    private void sendFile(File f, UploadPrep.Kind kind, int[] dim) {
         // Only a file we copied is ours to delete; a Gallery file is the user's.
-        final File tracked = f.getPath().contains("/outgoing/") ? f : null;
+        final File tracked = UploadPrep.isStaged(this, f) ? f : null;
         TdApi.InputFileLocal file = new TdApi.InputFileLocal(f.getPath());
         TdApi.InputMessageContent content;
 
         if (kind == UploadPrep.Kind.PHOTO) {
             TdApi.InputPhoto photo = new TdApi.InputPhoto();
             photo.photo = file;
-            int[] dim = UploadPrep.dimensionsOf(f);
             photo.width = dim == null ? 0 : dim[0];
             photo.height = dim == null ? 0 : dim[1];
 
@@ -922,7 +923,16 @@ public class ChatActivity extends Activity {
                         // The returned message carries the temporary id that
                         // UpdateMessageSendSucceeded will report as oldMessageId.
                         if (o instanceof TdApi.Message && tracked != null) {
-                            UploadCleanup.track(((TdApi.Message) o).id, tracked);
+                            UploadCleanup.track(chatId, ((TdApi.Message) o).id, tracked);
+                        } else if (o instanceof TdApi.Error) {
+                            UploadCleanup.discard(tracked);
+                            final String error = ((TdApi.Error) o).message;
+                            ui.post(new Runnable() {
+                                @Override public void run() {
+                                    if (!isFinishing()) Toast.makeText(ChatActivity.this, error,
+                                            Toast.LENGTH_LONG).show();
+                                }
+                            });
                         }
                     }
                 });

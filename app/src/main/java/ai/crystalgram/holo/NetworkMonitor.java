@@ -27,23 +27,14 @@ import org.drinkless.tdlib.TdApi;
  * sockets TDLib holds are dead. Without a setNetworkType call TDLib can sit on
  * those dead sockets, and the only thing that clears them is restarting the
  * process - which is exactly what a force-stop does.
- *
- * It also reports the state to a listener so a screen can say something honest
- * instead of showing an empty chat list with no explanation.
  */
 final class NetworkMonitor {
 
     private static final String TAG = "CG-Net";
 
-    /** Reports a connectivity change worth re-sending to TDLib. */
-    interface Listener {
-        void onNetworkAvailable(boolean available, TdApi.NetworkType type);
-    }
-
     private final Context context;
     private final ConnectivityManager cm;
     private BroadcastReceiver receiver;
-    private Listener listener;
 
     NetworkMonitor(Context context) {
         this.context = context.getApplicationContext();
@@ -51,8 +42,7 @@ final class NetworkMonitor {
                 Context.CONNECTIVITY_SERVICE);
     }
 
-    void start(Listener l) {
-        listener = l;
+    void start() {
         if (receiver != null) return;
         receiver = new BroadcastReceiver() {
             @Override public void onReceive(Context c, Intent intent) {
@@ -63,17 +53,6 @@ final class NetworkMonitor {
         f.addAction(ConnectivityManager.CONNECTIVITY_ACTION);
         context.registerReceiver(receiver, f);
         sync("start");
-    }
-
-    void stop() {
-        if (receiver != null) {
-            try {
-                context.unregisterReceiver(receiver);
-            } catch (Throwable ignored) {
-                // already gone
-            }
-            receiver = null;
-        }
     }
 
     /**
@@ -87,9 +66,6 @@ final class NetworkMonitor {
         // null means networkTypeOther to TDLib, which is the right answer when
         // we cannot tell what we are on.
         Td.send(new TdApi.SetNetworkType(type));
-        if (listener != null) {
-            listener.onNetworkAvailable(!(type instanceof TdApi.NetworkTypeNone), type);
-        }
     }
 
     private TdApi.NetworkType currentType() {

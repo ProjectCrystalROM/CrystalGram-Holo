@@ -38,10 +38,6 @@ final class MediaVm {
         return loader.bitmap(fileId);
     }
 
-    int percent() {
-        return 0;
-    }
-
     /**
      * Builds a description of the media in a message, and asks TDLib for the
      * smallest adequate file. Returns null for text messages and anything with
@@ -54,18 +50,18 @@ final class MediaVm {
             TdApi.Photo p = ((TdApi.MessagePhoto) c).photo;
             TdApi.File f = pickPhotoSize(p);
             if (f == null) return null;
-            loader.need(f.id, MediaLoader.WANT_THUMB, 1);
+            loader.need(f);
             return make(NONE, f, "Photo", loader);
         }
 
         if (c instanceof TdApi.MessageSticker) {
             TdApi.Sticker st = ((TdApi.MessageSticker) c).sticker;
-            if (st.sticker == null) return null;
+            if (st == null || st.sticker == null) return null;
             // Stickers are small; take the thumbnail if there is one, else the
             // sticker file itself.
             TdApi.File f = st.thumbnail != null && st.thumbnail.file != null
                     ? st.thumbnail.file : st.sticker;
-            loader.need(f.id, MediaLoader.WANT_THUMB, 1);
+            loader.need(f);
             String emoji = st.emoji == null ? "" : st.emoji;
             return make(NONE, f, emoji.length() == 0 ? "Sticker" : emoji, loader);
         }
@@ -77,12 +73,11 @@ final class MediaVm {
             // not something to do in a list.
             TdApi.File f = null;
             if (v.thumbnail != null) f = v.thumbnail.file;
-            if (f == null) f = v.video;
             String dur = v.duration > 0 ? " " + clockOf(v.duration) : "";
             if (f == null) {
                 return new MediaVm(NONE, 0, READY, "Video" + dur, loader);
             }
-            loader.need(f.id, MediaLoader.WANT_THUMB, 1);
+            loader.need(f);
             return make(NONE, f, "Video" + dur, loader);
         }
 
@@ -95,7 +90,7 @@ final class MediaVm {
             if (f == null) return new MediaVm(NONE, 0, READY, name, loader);
             // Only fetch metadata-sized bytes for the icon; the file itself is
             // downloaded when the user taps it.
-            return new MediaVm(NONE, f.id, sizeState(f), name + sizeSuffix(f), loader);
+            return new MediaVm(NONE, f.id, READY, name + sizeSuffix(f), loader);
         }
 
         if (c instanceof TdApi.MessageVoiceNote) {

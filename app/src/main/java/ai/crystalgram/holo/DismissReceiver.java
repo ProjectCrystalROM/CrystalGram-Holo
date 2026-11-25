@@ -18,6 +18,6 @@ public class DismissReceiver extends BroadcastReceiver {
         if (intent == null) return;
         if (!NotificationService.ACTION_DISMISS.equals(intent.getAction())) return;
         int groupId = intent.getIntExtra("groupId", 0);
-        NotificationService.onDismissedStatic(groupId);
+        NotificationService.onDismissedStatic(groupId, intent.getIntExtra("notificationId", 0));
     }
 }

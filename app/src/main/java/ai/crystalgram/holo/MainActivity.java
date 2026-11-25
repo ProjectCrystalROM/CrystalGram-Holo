@@ -39,6 +39,7 @@ public class MainActivity extends android.app.Activity {
     private ListView list;
     private TextView empty;
     private ChatListAdapter adapter;
+    private boolean destroyed;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
 
@@ -85,7 +86,6 @@ public class MainActivity extends android.app.Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         setContentView(contentRoot);
 
-        loadChatsFromCacheThenNetwork();
     }
 
     /**
@@ -157,7 +157,12 @@ public class MainActivity extends android.app.Activity {
             return true;
         }
         if (item.getItemId() == 2) {
-            Td.send(new TdApi.LogOut());
+            Td.beginLogout();
+            Td.send(new TdApi.LogOut(), new Client.ResultHandler() {
+                @Override public void onResult(TdApi.Object result) {
+                    if (result instanceof TdApi.Error) Td.onLogoutError((TdApi.Error) result);
+                }
+            });
             startActivity(new Intent(this, LoginActivity.class));
             finish();
             return true;
@@ -171,9 +176,14 @@ public class MainActivity extends android.app.Activity {
     void onChatsLoaded(long[] chatIds) {
         Log.i(TAG, "GetChats returned " + (chatIds == null ? 0 : chatIds.length));
         final List<Long> ids = new ArrayList<Long>();
-        for (long id : chatIds) ids.add(id);
+        if (chatIds != null) for (long id : chatIds) ids.add(id);
         ui.post(new Runnable() {
-            @Override public void run() { requestTitles(ids); }
+            @Override public void run() {
+                if (destroyed) return;
+                adapter.retain(ids);
+                requestTitles(ids);
+                updateEmptyLabel();
+            }
         });
     }
 
@@ -202,24 +212,27 @@ public class MainActivity extends android.app.Activity {
     }
 
     private void refreshOne(long chatId) {
-        Td.send(new TdApi.GetChat(chatId));
+        requestTitles(java.util.Collections.singletonList(chatId));
     }
 
     /** Called from the TDLib update thread with a resolved chat. */
     void onChat(TdApi.Chat chat) {
-        Log.i(TAG, "chat " + chat.id + " order=" + ChatRow.orderOf(chat)
-                + " type=" + chat.type.getClass().getSimpleName()
-                + " title=" + chat.title);
+
+        Td.cacheChat(chat);
         final ChatRow row = ChatRow.from(chat);
         ui.post(new Runnable() {
             @Override public void run() {
+                if (destroyed) return;
                 adapter.put(row);
-                empty.setVisibility(adapter.getCount() == 0 ? View.VISIBLE : View.GONE);
-                if (adapter.getCount() == 0) {
-                    empty.setText("No chats yet.");
-                }
+                updateEmptyLabel();
             }
         });
+    }
+
+    private void updateEmptyLabel() {
+        boolean noChats = adapter.getCount() == 0;
+        empty.setVisibility(noChats ? View.VISIBLE : View.GONE);
+        if (noChats) empty.setText("No chats yet.");
     }
 
     // ------------------------------------------------------------------- adapter
@@ -243,11 +256,11 @@ public class MainActivity extends android.app.Activity {
 
         /** Order of this chat in the main list, or MAX_VALUE if not there. */
         static long orderOf(TdApi.Chat chat) {
-            if (chat.positions == null) return Long.MAX_VALUE;
+            if (chat.positions == null) return 0L;
             for (TdApi.ChatPosition p : chat.positions) {
                 if (p.list instanceof TdApi.ChatListMain) return p.order;
             }
-            return Long.MAX_VALUE;
+            return 0L;
         }
 
         /**
@@ -293,11 +306,27 @@ public class MainActivity extends android.app.Activity {
         private final List<ChatRow> rows = new ArrayList<ChatRow>();
         private final Map<Long, ChatRow> byId = new HashMap<Long, ChatRow>();
 
+        void retain(List<Long> ids) {
+            java.util.HashSet<Long> current = new java.util.HashSet<>(ids);
+            java.util.Iterator<ChatRow> iterator = rows.iterator();
+            boolean changed = false;
+            while (iterator.hasNext()) {
+                long id = iterator.next().chatId;
+                if (!current.contains(id)) {
+                    iterator.remove();
+                    byId.remove(id);
+                    changed = true;
+                }
+            }
+            if (changed) notifyDataSetChanged();
+        }
+
         void put(ChatRow row) {
-            if (!row.supported) {
+            if (!row.supported || row.order == 0) {
                 // Drop unsupported chats (channels) from this stage's list.
                 if (byId.remove(row.chatId) != null) {
                     rows.remove(findIndex(row.chatId));
+                    notifyDataSetChanged();
                 }
                 return;
             }
@@ -327,14 +356,14 @@ public class MainActivity extends android.app.Activity {
          *
          * No unsigned transform: order values are positive here, and flipping
          * the sign bit on a positive long inverts the comparison. A plain
-         * descending Long.compare gives the order TDLib specifies.
+         * descending comparison gives the order TDLib specifies.
          */
         private void sort() {
             java.util.Collections.sort(rows, new java.util.Comparator<ChatRow>() {
                 @Override public int compare(ChatRow a, ChatRow b) {
-                    int c = Long.compare(b.order, a.order);   // descending
+                    int c = compareDescending(a.order, b.order);   // descending
                     if (c != 0) return c;
-                    return Long.compare(b.chatId, a.chatId);  // tie-break, descending
+                    return compareDescending(a.chatId, b.chatId);  // tie-break, descending
                 }
             });
         }
@@ -371,53 +400,45 @@ public class MainActivity extends android.app.Activity {
         }
     }
 
-    private NetworkMonitor net;
+    private static int compareDescending(long left, long right) {
+        if (left == right) return 0;
+        return left > right ? -1 : 1;
+    }
 
     @Override
     protected void onResume() {
         super.onResume();
-        startNetworkWatch();
-        // Visible chat list counts as present: TDLib may suppress notifications
-        // while online, which is correct only while a screen is in front.
+        if (!Td.authorized()) {
+            startActivity(new Intent(this, LoginActivity.class));
+            finish();
+            return;
+        }
+        Td.bindChatList(this);
         Td.setOnline(true);
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-        Td.setOnline(false);
-        if (net != null) net.stop();
-        Td.setConnectionListener(null);
-    }
-
-    // ---- connection -------------------------------------------------------
-
-    /**
-     * Starts watching the network and showing connection state.
-     *
-     * Without this a dropped connection looks identical to an empty chat list,
-     * and the only way out was to force-stop the app.
-     */
-    private void startNetworkWatch() {
-        if (net == null) net = new NetworkMonitor(this);
-        net.start(new NetworkMonitor.Listener() {
-            @Override public void onNetworkAvailable(boolean available, TdApi.NetworkType type) {
-                runOnUiThread(new Runnable() {
-                    @Override public void run() {
-                        if (available && Td.isReady()) hideConnBanner();
-                        if (available) reloadChatsIfEmpty();
-                    }
-                });
-            }
-        });
         Td.setConnectionListener(new Td.ConnectionListener() {
-            @Override public void onConnectionState(final TdApi.ConnectionState st) {
-                runOnUiThread(new Runnable() {
-                    @Override public void run() { showConnState(st); }
+            @Override public void onConnectionState(final TdApi.ConnectionState state) {
+                ui.post(new Runnable() {
+                    @Override public void run() { if (!isFinishing()) showConnState(state); }
                 });
             }
         });
         if (Td.connectionState() != null) showConnState(Td.connectionState());
+        loadChatsFromCacheThenNetwork();
+    }
+
+    @Override
+    protected void onDestroy() {
+        destroyed = true;
+        ui.removeCallbacksAndMessages(null);
+        super.onDestroy();
+    }
+
+    @Override
+    protected void onPause() {
+        Td.unbindChatList(this);
+        Td.setOnline(false);
+        Td.setConnectionListener(null);
+        super.onPause();
     }
 
     private TextView connBanner;
@@ -456,10 +477,4 @@ public class MainActivity extends android.app.Activity {
         if (connBanner != null) connBanner.setVisibility(View.GONE);
     }
 
-    /** A connection that just came up should fill a list that came up empty. */
-    private void reloadChatsIfEmpty() {
-        if (Td.isReady()) {
-            Td.send(new TdApi.LoadChats(new TdApi.ChatListMain(), 100));
-        }
-    }
 }

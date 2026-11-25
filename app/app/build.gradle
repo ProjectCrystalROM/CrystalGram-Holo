@@ -10,7 +10,19 @@ if (localFile.exists()) {
 def tgApiId = (localProps.getProperty('api_id') ?: '0').trim()
 def tgApiHash = (localProps.getProperty('api_hash') ?: '').trim()
 
+// Release signing material, also from local.properties. Absent on a machine
+// that only builds debug, so the release config is only created when all four
+// values are present - a missing keystore must not break assembleDebug.
+def ksPath = localProps.getProperty('keystore.path')
+def ksPass = localProps.getProperty('keystore.password')
+def ksAlias = localProps.getProperty('keystore.alias')
+def ksKeyPass = localProps.getProperty('keystore.keyPassword') ?: ksPass
+def hasSigning = ksPath && ksPass && ksAlias
+
 android {
+    // The repository keeps Android sources in app/src.
+    sourceSets.main.setRoot('../src/main')
+
     compileSdk 34
     ndkVersion '23.2.8568313'
     buildToolsVersion '34.0.0'
@@ -28,6 +40,42 @@ android {
 
     buildFeatures {
         buildConfig true
+    }
+
+    /**
+     * Diagnostics are a build-time decision, not a runtime flag.
+     *
+     * debug: tracing on, TDLib verbose enough to be useful, per-render trace
+     *        lines written to a file (the only instrument that works here -
+     *        logcat is a 256 KB ring TDLib fills within seconds).
+     * release: all of it compiled out. The compiler drops the branches, so a
+     *        shipped build carries no trace strings and does no file writes
+     *        on the notification path.
+     */
+    signingConfigs {
+        if (hasSigning) {
+            release {
+                storeFile file(ksPath)
+                storePassword ksPass
+                keyAlias ksAlias
+                keyPassword ksKeyPass
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            buildConfigField "boolean", "DIAGNOSTICS", "true"
+        }
+        release {
+            buildConfigField "boolean", "DIAGNOSTICS", "false"
+            minifyEnabled false
+            // Only sign when the keystore is configured; otherwise the release
+            // APK is produced unsigned and clearly not distributable.
+            if (hasSigning) {
+                signingConfig signingConfigs.release
+            }
+        }
     }
 
     packagingOptions {

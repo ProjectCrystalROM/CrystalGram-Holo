@@ -6,7 +6,6 @@ import org.drinkless.tdlib.TdApi;
 
 import java.io.File;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.Map;
 
 /**
@@ -26,47 +25,37 @@ final class UploadCleanup {
 
     private static final String TAG = "CG-Upload";
 
-    /** temporary message id -> staged file waiting to be deleted. */
-    private static final Map<Long, File> pending = new HashMap<Long, File>();
+    private static final Map<Long, Map<Long, File>> pending = new HashMap<>();
 
     private UploadCleanup() {}
 
-    /** Records a staged file against the message id TDLib will report. */
-    static void track(long temporaryMessageId, File staged) {
+    static synchronized void track(long chatId, long temporaryMessageId, File staged) {
         if (staged == null) return;
-        synchronized (pending) {
-            pending.put(temporaryMessageId, staged);
+        Map<Long, File> uploads = pending.get(chatId);
+        if (uploads == null) {
+            uploads = new HashMap<>();
+            pending.put(chatId, uploads);
         }
+        uploads.put(temporaryMessageId, staged);
     }
 
-    /** TDLib confirmed the message reached the server. */
-    static void onSent(TdApi.Message m) {
-        if (m == null) return;
-        File f = take(m.id);
-        delete(f);
+    static void onSent(long chatId, long oldId) {
+        discard(take(chatId, oldId));
     }
 
-    /**
-     * The send failed for good.
-     *
-     * The file is kept: a failure may be transient (EVDO dropping mid-upload)
-     * and the user may retry. cache/outgoing is pruned by the system and by
-     * sweep() on next launch, so a permanently failed upload does not leak.
-     */
-    static void onFailed(TdApi.Message m) {
-        if (m == null) return;
-        synchronized (pending) {
-            pending.remove(m.id);
-        }
+    static void onFailed(long chatId, long oldId) {
+        take(chatId, oldId);
     }
 
-    private static File take(long id) {
-        synchronized (pending) {
-            return pending.remove(id);
-        }
+    private static synchronized File take(long chatId, long id) {
+        Map<Long, File> uploads = pending.get(chatId);
+        if (uploads == null) return null;
+        File file = uploads.remove(id);
+        if (uploads.isEmpty()) pending.remove(chatId);
+        return file;
     }
 
-    private static void delete(File f) {
+    static void discard(File f) {
         if (f == null) return;
         try {
             if (f.exists() && f.delete()) {
@@ -77,20 +66,4 @@ final class UploadCleanup {
         }
     }
 
-    /**
-     * Deletes leftovers from previous runs.
-     *
-     * A copy is only meaningful while its upload is in flight; once the process
-     * dies nothing will ever send it again. Called once at startup.
-     */
-    static void sweep(File dir) {
-        if (dir == null || !dir.isDirectory()) return;
-        File[] files = dir.listFiles();
-        if (files == null) return;
-        int n = 0;
-        for (File f : files) {
-            if (f.isFile() && f.delete()) n++;
-        }
-        if (n > 0) Log.i(TAG, "swept " + n + " stale staged file(s)");
-    }
 }

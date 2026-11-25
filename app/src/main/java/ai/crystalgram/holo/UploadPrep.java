@@ -61,10 +61,8 @@ final class UploadPrep {
      * upload time, which is a much worse failure than at pick time.
      */
     static File resolvePath(Context ctx, Uri uri) {
-        if ("file".equals(uri.getScheme())) {
-            File f = new File(uri.getPath());
-            return f.canRead() ? f : null;
-        }
+        if ("file".equals(uri.getScheme())) return readableExternalFile(uri.getPath());
+        if (!"media".equals(uri.getAuthority())) return null;
         android.database.Cursor c = null;
         try {
             String[] cols = {android.provider.MediaStore.MediaColumns.DATA};
@@ -72,17 +70,26 @@ final class UploadPrep {
             if (c == null || !c.moveToFirst()) return null;
             String path = c.getString(0);
             if (path == null || path.length() == 0) return null;
-            File f = new File(path);
-            if (!f.isFile() || !f.canRead() || f.length() == 0) return null;
-            // Prove it opens; isFile() alone can lie across mount views.
-            FileInputStream probe = new FileInputStream(f);
-            probe.close();
-            Log.i(TAG, "resolved direct path " + path + " (" + f.length() + " bytes)");
-            return f;
+            return readableExternalFile(path);
         } catch (Throwable t) {
             return null;
         } finally {
             if (c != null) c.close();
+        }
+    }
+
+    private static File readableExternalFile(String path) {
+        if (path == null) return null;
+        try {
+            File file = new File(path).getCanonicalFile();
+            String external = android.os.Environment.getExternalStorageDirectory()
+                    .getCanonicalPath() + File.separator;
+            if (!file.getPath().startsWith(external) || !file.isFile()) return null;
+            try (FileInputStream probe = new FileInputStream(file)) {
+                return file;
+            }
+        } catch (java.io.IOException | SecurityException e) {
+            return null;
         }
     }
 
@@ -96,27 +103,32 @@ final class UploadPrep {
      * Copying also gives a stable file to re-read if the upload is retried.
      */
     static File stage(Context ctx, Uri uri, String displayName) throws Exception {
+        if ("file".equals(uri.getScheme()) && readableExternalFile(uri.getPath()) == null) {
+            throw new java.io.IOException("File picker must provide a readable shared file");
+        }
         String name = displayName;
         if (name == null || name.length() == 0) name = "upload";
-        name = name.replaceAll("[^A-Za-z0-9._-]", "_");
+        name = name.replace('/', '_').replace('\\', '_').replace((char) 0, '_');
+        if (name.length() > 50) {
+            int end = Character.isHighSurrogate(name.charAt(49)) ? 49 : 50;
+            name = name.substring(0, end);
+        }
         File dir = new File(ctx.getCacheDir(), "outgoing");
-        if (!dir.exists() && !dir.mkdirs()) throw new Exception("cannot create " + dir);
+        if (!dir.isDirectory() && !dir.mkdirs() && !dir.isDirectory()) throw new Exception("cannot create " + dir);
 
-        // Unique prefix so two picks of the same name do not collide.
-        File out = new File(dir, System.currentTimeMillis() + "-" + name);
-        InputStream in = ctx.getContentResolver().openInputStream(uri);
-        if (in == null) throw new Exception("cannot open " + uri);
+        File out = File.createTempFile("cg-", "-" + name, dir);
+        boolean complete = false;
         try {
-            OutputStream os = new FileOutputStream(out);
-            try {
+            try (InputStream in = ctx.getContentResolver().openInputStream(uri);
+                 OutputStream os = new FileOutputStream(out)) {
+                if (in == null) throw new java.io.IOException("Cannot open " + uri);
                 byte[] buf = new byte[16 * 1024];
                 int n;
-                while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
-            } finally {
-                os.close();
+                while ((n = in.read(buf)) != -1) os.write(buf, 0, n);
             }
+            complete = true;
         } finally {
-            in.close();
+            if (!complete) UploadCleanup.discard(out);
         }
         Log.i(TAG, "staged " + out.getName() + " " + out.length() + " bytes");
         return out;
@@ -128,7 +140,18 @@ final class UploadPrep {
      * Returns the original file when it is already small enough, so a photo
      * that needs nothing is not recompressed for no reason.
      */
-    static File shrinkPhoto(File src, int maxPx, int quality) {
+    static boolean isStaged(Context context, File file) {
+        try {
+            return new File(context.getCacheDir(), "outgoing").getCanonicalFile()
+                    .equals(file.getCanonicalFile().getParentFile());
+        } catch (java.io.IOException e) {
+            return false;
+        }
+    }
+
+    static File shrinkPhoto(Context context, File src, int maxPx, int quality) {
+        File out = null;
+        Bitmap bmp = null;
         try {
             BitmapFactory.Options probe = new BitmapFactory.Options();
             probe.inJustDecodeBounds = true;
@@ -146,7 +169,7 @@ final class UploadPrep {
 
             BitmapFactory.Options opts = new BitmapFactory.Options();
             opts.inSampleSize = sample;
-            Bitmap bmp = BitmapFactory.decodeFile(src.getPath(), opts);
+            bmp = BitmapFactory.decodeFile(src.getPath(), opts);
             if (bmp == null) return src;
 
             // inSampleSize only halves, so finish the job by scaling exactly.
@@ -162,20 +185,23 @@ final class UploadPrep {
                 bmp = scaled;
             }
 
-            File out = new File(src.getParentFile(), "small-" + src.getName() + ".jpg");
-            OutputStream os = new FileOutputStream(out);
-            try {
-                bmp.compress(Bitmap.CompressFormat.JPEG, quality, os);
-            } finally {
-                os.close();
-                bmp.recycle();
+            File dir = new File(context.getCacheDir(), "outgoing");
+            if (!dir.isDirectory() && !dir.mkdirs() && !dir.isDirectory()) return src;
+            out = File.createTempFile("cg-photo-", ".jpg", dir);
+            try (OutputStream os = new FileOutputStream(out)) {
+                if (!bmp.compress(Bitmap.CompressFormat.JPEG, quality, os)) {
+                    throw new java.io.IOException("JPEG encoding failed");
+                }
             }
             Log.i(TAG, "shrunk " + src.length() + " -> " + out.length() + " bytes");
             return out;
-        } catch (Throwable t) {
+        } catch (java.io.IOException | RuntimeException | OutOfMemoryError t) {
+            UploadCleanup.discard(out);
             // A failed shrink must never lose the send: fall back to the original.
             Log.w(TAG, "shrink failed, sending original", t);
             return src;
+        } finally {
+            if (bmp != null) bmp.recycle();
         }
     }
 
@@ -195,7 +221,7 @@ final class UploadPrep {
      * practice, and quoting the good end of that range makes every send feel
      * broken.
      */
-    static String estimate(int bytes, boolean slowLink) {
+    static String estimate(long bytes, boolean slowLink) {
         if (!slowLink) return null;
         // ~110 kbps = ~13.75 kB/s.
         int seconds = (int) Math.ceil(bytes / 13750.0);
