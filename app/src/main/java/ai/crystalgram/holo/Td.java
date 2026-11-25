@@ -411,6 +411,20 @@ public final class Td {
                     a.onChatUpdated(u.chatId);
                 }
 
+            } else if (object instanceof TdApi.UpdateChatPhoto) {
+                TdApi.UpdateChatPhoto update = (TdApi.UpdateChatPhoto) object;
+                TdApi.Chat chat;
+                synchronized (lock) {
+                    chat = chats.get(update.chatId);
+                    if (chat != null) chat.photo = update.photo;
+                }
+                MainActivity list = chatList;
+                if (list != null && chat != null) list.onChat(chat);
+                ChatActivity screen = conversation;
+                if (screen != null) screen.onChatPhotoChanged(update.chatId);
+                ForumActivity topics = forum;
+                if (topics != null) topics.onChatPhotoChanged(update.chatId);
+
             } else if (object instanceof TdApi.UpdateChatTitle) {
                 MainActivity a = chatList;
                 if (a != null) a.onChatUpdated(((TdApi.UpdateChatTitle) object).chatId);

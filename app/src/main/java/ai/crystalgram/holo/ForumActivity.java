@@ -142,6 +142,8 @@ public class ForumActivity extends Activity {
                 return;
             }
             setTitle(chat.title);
+            MediaLoader.get().addListener(avatarListener);
+            ChatAvatar.showInActionBar(this, chat);
             if (getActionBar() != null) getActionBar().setSubtitle(R.string.forum_topics);
             opened = true;
             Td.bindForum(this);
@@ -158,10 +160,22 @@ public class ForumActivity extends Activity {
         if (opened) {
             opened = false;
             Td.unbindForum(this);
+            MediaLoader.get().removeListener(avatarListener);
             Td.setOnline(false);
             Td.send(new TdApi.CloseChat(chatId));
         }
         super.onPause();
+    }
+
+    private final MediaLoader.Listener avatarListener = (ignored, fileId) -> ui.post(() -> {
+        TdApi.Chat chat = Td.chat(chatId);
+        if (opened && ChatAvatar.matches(chat, fileId)) ChatAvatar.showInActionBar(this, chat);
+    });
+
+    void onChatPhotoChanged(long id) {
+        if (id == chatId) ui.post(() -> {
+            if (opened) ChatAvatar.showInActionBar(this, Td.chat(id));
+        });
     }
 
     void onTopicsChanged(long id) {

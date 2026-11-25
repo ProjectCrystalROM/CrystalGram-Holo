@@ -395,6 +395,7 @@ public class MainActivity extends android.app.Activity {
             } else {
                 tv = new TextView(MainActivity.this);
                 tv.setTextSize(15);
+                tv.setCompoundDrawablePadding(dp(12));
                 tv.setPadding(dp(16), dp(12), dp(16), dp(12));
                 tv.setLineSpacing(dp(2), 1f);
             }
@@ -411,6 +412,9 @@ public class MainActivity extends android.app.Activity {
                         sb.length(), android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
             }
             tv.setText(sb);
+            TdApi.Chat chat = Td.chat(r.chatId);
+            tv.setCompoundDrawablesWithIntrinsicBounds(
+                    chat == null ? null : new ChatAvatar(chat, dp(40)), null, null, null);
             return tv;
         }
     }
@@ -419,6 +423,16 @@ public class MainActivity extends android.app.Activity {
         if (left == right) return 0;
         return left > right ? -1 : 1;
     }
+
+    private final MediaLoader.Listener avatarListener = (ignored, fileId) -> ui.post(() -> {
+        if (destroyed || !Td.authorized()) return;
+        for (int i = list.getFirstVisiblePosition(); i <= list.getLastVisiblePosition(); i++) {
+            if (i >= 0 && i < adapter.getCount() && ChatAvatar.matches(Td.chat(adapter.getItem(i).chatId), fileId)) {
+                list.invalidateViews();
+                return;
+            }
+        }
+    });
 
     @Override
     protected void onResume() {
@@ -429,6 +443,7 @@ public class MainActivity extends android.app.Activity {
             return;
         }
         Td.bindChatList(this);
+        MediaLoader.get().addListener(avatarListener);
         Td.setOnline(true);
         Td.setConnectionListener(new Td.ConnectionListener() {
             @Override public void onConnectionState(final TdApi.ConnectionState state) {
@@ -451,6 +466,7 @@ public class MainActivity extends android.app.Activity {
     @Override
     protected void onPause() {
         Td.unbindChatList(this);
+        MediaLoader.get().removeListener(avatarListener);
         Td.setOnline(false);
         Td.setConnectionListener(null);
         super.onPause();

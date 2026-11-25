@@ -1,6 +1,8 @@
 # CrystalGram Holo
 
-**1.0 · Prismatic Echo**
+**1.0.1 · Prismatic Echo · Visible Spectrum**
+
+*Putting Faces to Familiar Names*
 
 **CrystalGram Holo is an unofficial client that uses the Telegram API and is
 part of the Telegram ecosystem.** It runs on Android 4.1–4.3 (Jelly Bean,
@@ -19,6 +21,7 @@ CyanogenMod 10.2 — Android 4.3.1, API 18, armeabi-v7a.
 |---|---|
 | Dark Holo chrome (platform widgets, no AndroidX/Material) | working |
 | CrystalGram bubbles: rounded corners, tail, per-bubble timestamps | working |
+| Profile pictures | chat lists, conversation and forum headers |
 | TDLib backend, native bridge on armv7 | working |
 | Existing-account sign-in: phone, code, optional password | supported |
 | Chat list for private chats and groups, Telegram's own ordering | working |

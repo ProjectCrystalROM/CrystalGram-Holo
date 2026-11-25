@@ -207,6 +207,7 @@ public class ChatActivity extends Activity {
                 return;
             }
             chatTitle = Td.chatTitle(chat);
+            ChatAvatar.showInActionBar(this, chat);
             peerId = chat.type instanceof TdApi.ChatTypePrivate ? ((TdApi.ChatTypePrivate) chat.type).userId : 0;
             if (topicId == 0) {
                 advanceReadOutbox(chat.lastReadOutboxMessageId);
@@ -422,6 +423,12 @@ public class ChatActivity extends Activity {
         if (!maySend()) input.setHint(R.string.forum_topic_closed);
         else input.setHint("Message");
         setComposerEnabled(resumed && maySend());
+    }
+
+    void onChatPhotoChanged(long id) {
+        if (id == chatId) ui.post(() -> {
+            if (resumed && !isFinishing()) ChatAvatar.showInActionBar(this, Td.chat(id));
+        });
     }
 
     void onTopicInfo(TdApi.ForumTopicInfo info) {
@@ -784,7 +791,12 @@ public class ChatActivity extends Activity {
     private final MediaLoader.Listener mediaListener = new MediaLoader.Listener() {
         @Override public void onMediaUpdated(long ignoredChatId, int fileId) {
             ui.post(new Runnable() {
-                @Override public void run() { if (resumed) adapter.notifyDataSetChanged(); }
+                @Override public void run() {
+                    if (!resumed) return;
+                    TdApi.Chat chat = Td.chat(chatId);
+                    if (ChatAvatar.matches(chat, fileId)) ChatAvatar.showInActionBar(ChatActivity.this, chat);
+                    else adapter.notifyDataSetChanged();
+                }
             });
         }
     };

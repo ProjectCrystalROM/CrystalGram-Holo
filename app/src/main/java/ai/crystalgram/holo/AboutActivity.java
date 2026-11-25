@@ -20,7 +20,9 @@ public class AboutActivity extends Activity {
         tv.setTextSize(14);
         tv.setText(
             getString(R.string.app_name) + "\n" +
-            getString(R.string.release_branding, BuildConfig.VERSION_NAME) + "\n\n" +
+            getString(R.string.release_branding, BuildConfig.VERSION_NAME) + "\n" +
+            getString(R.string.release_subname) + "\n" +
+            getString(R.string.release_tagline) + "\n\n" +
             "Device      : " + Build.MANUFACTURER + " " + Build.MODEL + "\n" +
             "Android     : " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")\n" +
             "ABI         : " + Build.CPU_ABI

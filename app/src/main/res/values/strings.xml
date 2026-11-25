@@ -3,5 +3,7 @@
     <string name="app_name">CrystalGram Holo</string>
     <string name="about_title">About</string>
     <string name="release_branding">%1$s · Prismatic Echo</string>
+    <string name="release_subname">Visible Spectrum</string>
+    <string name="release_tagline">Putting Faces to Familiar Names</string>
     <string name="login_existing_account_only">Sign in with an existing account. To create an account, use an official Telegram app.</string>
 </resources>
